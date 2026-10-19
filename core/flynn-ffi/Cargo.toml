@@ -27,6 +27,10 @@ flynn-rules.workspace = true
 flynn-dataplane.workspace = true
 flynn-store.workspace = true
 uniffi.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+flynn-proto.workspace = true
 
 [lints]
 workspace = true

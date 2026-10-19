@@ -1,12 +1,13 @@
-//! What the data plane reports. In M1 events go to a sink the host
-//! supplies (the harness prints them); M2 adds the spool writer.
+//! What the data plane reports. Events go to a sink: the spool on devices
+//! (see `spool`), printed lines in the harness.
 
 use std::net::IpAddr;
 
 use flynn_rules::Verdict;
 use flynn_types::AppId;
 
-use crate::{FlowKey, NameSource};
+use crate::mem::MemSample;
+use crate::{FlowKey, NameSource, StatsSnapshot};
 
 pub type FlowId = u64;
 
@@ -38,6 +39,12 @@ pub enum Event {
         at_ms: i64,
         name: String,
         addrs: Vec<IpAddr>,
+    },
+    /// Periodic measurement of the capture process and forwarder counters.
+    Sample {
+        at_ms: i64,
+        mem: MemSample,
+        stats: StatsSnapshot,
     },
 }
 
@@ -75,6 +82,10 @@ impl CloseReason {
 
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: Event);
+
+    /// Called on every forwarder pass, so a buffering sink can flush on a
+    /// timer without a thread of its own.
+    fn tick(&self) {}
 }
 
 /// Discards every event.

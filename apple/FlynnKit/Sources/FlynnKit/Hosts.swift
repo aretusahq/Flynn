@@ -1,5 +1,6 @@
 import Foundation
 import os
+import UserNotifications
 
 /// Host implementations shared by the iOS capture extensions. Each one is a
 /// platform answer to a trait in `flynn-dataplane/src/host.rs`.
@@ -28,8 +29,21 @@ public final class NoAppResolver: HostAppResolver {
     public func resolve(flow: FlowKey) -> AppId? { nil }
 }
 
-/// Writes notifications to the unified log until M2 settles whether the
-/// tunnel extension can post user notifications directly.
+/// Posts a local notification. M2 checks whether one posted from the tunnel
+/// extension reaches the user; the app must have asked for permission.
+public final class UserNotifier: HostNotifier {
+    public init() {}
+
+    public func notify(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+}
+
+/// Writes notifications to the unified log.
 public final class LogNotifier: HostNotifier {
     private let logger: Logger
 

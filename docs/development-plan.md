@@ -106,7 +106,7 @@ Each one ends with its exit criteria. "Human:" marks steps Claude can't do.
 - **Human:** run the harness live with sudo and browse normally for 30 minutes.
 - Exit: pages load, video streams, and throughput, CPU and RSS are recorded in `docs/spike-results.md`.
 
-### M2 — Spike B: packet tunnel on the iPhone (unsupervised)
+### M2 — Spike B: packet tunnel on the iPhone (unsupervised) (code done 19 Oct; device runs pending)
 - A minimal tunnel extension around the M1 data plane, logging domain, IP, port and bytes to the spool, and a debug screen in the app that tails it.
 - Measure: peak and steady memory in the extension (`task_vm_info` sampled to the spool), battery over 24 hours, and throughput against Flynn off.
 - Try out: notifications posted from the extension, `includeAllNetworks` + `enforceRoutes`, on-demand rules restarting the tunnel after reboot or kill, and whether the device receives any unsolicited inbound traffic.

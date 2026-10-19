@@ -27,6 +27,8 @@ pub struct LiveOptions {
     pub policy: Arc<dyn Policy>,
     pub recv_buffer: usize,
     pub send_buffer: usize,
+    /// Also write events to a spool in this directory.
+    pub spool: Option<std::path::PathBuf>,
 }
 
 const TUN_V4: &str = "10.111.0.1";
@@ -115,7 +117,18 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
         opts.recv_buffer / 1024,
         opts.send_buffer / 1024
     );
-    let fwd = Arc::new(forwarder::spawn(host, config, sink.clone())?);
+    let spool = match &opts.spool {
+        Some(dir) => {
+            println!("spool: {}", dir.display());
+            Some(Arc::new(flynn_dataplane::spool::SpoolSink::open(dir)?))
+        }
+        None => None,
+    };
+    let tee: Arc<dyn EventSink> = Arc::new(Tee {
+        printer: sink.clone(),
+        spool: spool.clone(),
+    });
+    let fwd = Arc::new(forwarder::spawn(host, config, tee)?);
 
     // Reader: tunnel -> forwarder. Blocks in read(2) until the process exits.
     {
@@ -148,7 +161,7 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
             let up = (now.bytes_up - last.1.bytes_up) as f64 / secs;
             let down = (now.bytes_down - last.1.bytes_down) as f64 / secs;
             peak_rate = (peak_rate.0.max(up), peak_rate.1.max(down));
-            let mem = crate::mem::sample();
+            let mem = flynn_dataplane::mem::sample();
             println!(
                 "[{:>6.0}s] up {:>8} down {:>8}  tcp {:>3} udp {:>3}  opened {} blocked {} failed {} dropped {}  footprint {} (peak {})  cpu {:.1}s",
                 start.elapsed().as_secs_f64(),
@@ -162,14 +175,14 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
                 now.dropped,
                 mib(mem.footprint),
                 mib(mem.peak_footprint),
-                mem.cpu_secs,
+                (mem.cpu_ms as f64 / 1000.0),
             );
             last = (Instant::now(), now);
         }
     }
 
     let stats = fwd.stats();
-    let mem = crate::mem::sample();
+    let mem = flynn_dataplane::mem::sample();
     let elapsed = start.elapsed().as_secs_f64();
     if let Ok(fwd) = Arc::try_unwrap(fwd) {
         fwd.stop();
@@ -217,8 +230,8 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
     );
     println!(
         "cpu: {:.1} s user+system ({:.1}% of one core)",
-        mem.cpu_secs,
-        100.0 * mem.cpu_secs / elapsed
+        (mem.cpu_ms as f64 / 1000.0),
+        100.0 * (mem.cpu_ms as f64 / 1000.0) / elapsed
     );
     // Dropping the utun descriptor at exit removes the interface and routes.
     Ok(())
@@ -438,6 +451,29 @@ impl EventSink for Printer {
                 let addrs: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
                 println!("dns   {name} = {}", addrs.join(", "));
             }
+            // The periodic stats line already shows memory and counters.
+            Event::Sample { .. } => {}
+        }
+    }
+}
+
+/// Sends each event to the printer and, when enabled, the spool.
+struct Tee {
+    printer: Arc<Printer>,
+    spool: Option<Arc<flynn_dataplane::spool::SpoolSink>>,
+}
+
+impl EventSink for Tee {
+    fn emit(&self, event: Event) {
+        if let Some(spool) = &self.spool {
+            spool.emit(event.clone());
+        }
+        self.printer.emit(event);
+    }
+
+    fn tick(&self) {
+        if let Some(spool) = &self.spool {
+            spool.tick();
         }
     }
 }

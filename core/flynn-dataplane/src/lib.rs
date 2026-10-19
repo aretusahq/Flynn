@@ -8,9 +8,11 @@
 pub mod events;
 pub mod forwarder;
 pub mod host;
+pub mod mem;
 pub mod names;
 pub mod observe;
 pub mod policy;
+pub mod spool;
 
 use std::sync::Arc;
 
@@ -21,6 +23,7 @@ pub use forwarder::{ForwarderConfig, ForwarderHandle, StatsSnapshot};
 pub use host::{
     AppResolver, Clock, FlowKey, HostError, Notifier, PacketIo, Paths, SocketProtector, Transport,
 };
+pub use mem::MemSample;
 pub use names::NameSource;
 pub use policy::{DomainBlocklist, FlowMeta, ModePolicy, Policy};
 

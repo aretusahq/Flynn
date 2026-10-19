@@ -58,6 +58,8 @@ pub struct ForwarderConfig {
     pub dns_cache_size: usize,
     /// How long to hold a partial ClientHello waiting for the server name.
     pub sni_wait: Duration,
+    /// How often to emit an `Event::Sample` with memory and counters.
+    pub sample_every: Duration,
 }
 
 impl ForwarderConfig {
@@ -75,6 +77,7 @@ impl ForwarderConfig {
             max_udp_flows: 1024,
             dns_cache_size: 4096,
             sni_wait: Duration::from_millis(500),
+            sample_every: Duration::from_secs(10),
         }
     }
 }
@@ -227,6 +230,7 @@ struct Forwarder {
     next_id: FlowId,
     epoch: Instant,
     scratch: Vec<u8>,
+    last_sample: Option<Instant>,
 }
 
 impl Forwarder {
@@ -274,6 +278,7 @@ impl Forwarder {
             next_id: 1,
             epoch,
             scratch: vec![0; 64 * 1024],
+            last_sample: None,
         }
     }
 
@@ -322,6 +327,23 @@ impl Forwarder {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.reap();
         self.flush();
+        self.maybe_sample();
+        self.sink.tick();
+    }
+
+    fn maybe_sample(&mut self) {
+        if self
+            .last_sample
+            .is_some_and(|t| t.elapsed() < self.config.sample_every)
+        {
+            return;
+        }
+        self.last_sample = Some(Instant::now());
+        self.sink.emit(Event::Sample {
+            at_ms: self.now_ms(),
+            mem: crate::mem::sample(),
+            stats: self.stats.snapshot(),
+        });
     }
 
     fn next_id(&mut self) -> FlowId {

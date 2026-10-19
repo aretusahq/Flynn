@@ -370,9 +370,11 @@ name = "flynn-ffi"
 version = "0.1.0"
 dependencies = [
  "flynn-dataplane",
+ "flynn-proto",
  "flynn-rules",
  "flynn-store",
  "flynn-types",
+ "thiserror",
  "uniffi",
 ]
 

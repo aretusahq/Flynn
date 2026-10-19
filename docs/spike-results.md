@@ -24,3 +24,12 @@ stack plays the app, servers on 127.0.0.1 stand in for the internet.
 Pending: needs `sudo`; steps in [device-checklists.md](device-checklists.md#m1--forwarder-on-the-mac-needs-sudo).
 Record throughput against no-tunnel, peak footprint, CPU share, and anything
 that broke.
+
+## M2 — Packet tunnel on the iPhone
+
+Code is ready (19 Oct). Device results pending; steps are in
+[device-checklists.md](device-checklists.md#m2--packet-tunnel-on-the-iphone).
+To record: DNS visibility with and without the virtual resolver,
+notifications from the extension, on-demand restart after reboot, the effect
+of include-all-networks, 24-hour peak footprint and CPU, battery share, and
+throughput against tunnel-off.

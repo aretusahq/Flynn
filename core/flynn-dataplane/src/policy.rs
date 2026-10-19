@@ -28,9 +28,11 @@ impl Policy for ModePolicy {
 }
 
 /// Blocks flows whose name equals or is a subdomain of a listed domain;
-/// allows everything else. For the harness and tests until M4's rules.
+/// everything else gets the mode default (allow-all unless set). For the
+/// harness, tests and the M2 spike until M4's rules.
 pub struct DomainBlocklist {
     domains: Vec<String>,
+    mode: Mode,
 }
 
 impl DomainBlocklist {
@@ -40,7 +42,14 @@ impl DomainBlocklist {
                 .into_iter()
                 .map(|d| d.into().trim_matches('.').to_ascii_lowercase())
                 .collect(),
+            mode: Mode::AllowAll,
         }
+    }
+
+    /// Applies `mode` to flows the list does not match.
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
+        self
     }
 
     fn matches(&self, name: &str) -> bool {
@@ -58,7 +67,7 @@ impl Policy for DomainBlocklist {
     fn decide(&self, flow: &FlowMeta<'_>) -> Verdict {
         match flow.name {
             Some(name) if self.matches(name) => Verdict::Block,
-            _ => Verdict::Allow,
+            _ => self.mode.default_verdict(false, false),
         }
     }
 }
