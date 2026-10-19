@@ -63,7 +63,14 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
     )?;
     let mut routes = opts.routes.clone();
     if opts.all {
-        routes.extend(["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"].map(String::from));
+        routes.extend(["0.0.0.0/1", "128.0.0.0/1"].map(String::from));
+        // Claiming IPv6 on a Mac without IPv6 connectivity would make apps
+        // try IPv6 first and fail through us; only route it when it works.
+        if has_ipv6_default_route() {
+            routes.extend(["::/1", "8000::/1"].map(String::from));
+        } else {
+            println!("no IPv6 default route: routing IPv4 only");
+        }
     }
     if routes.is_empty() {
         println!("no routes given: nothing will reach the tunnel. Use --route CIDR or --all.");
@@ -249,6 +256,15 @@ fn sh(cmd: &str, args: &[&str]) -> io::Result<()> {
     }
 }
 
+fn has_ipv6_default_route() -> bool {
+    Command::new("route")
+        .args(["-n", "get", "-inet6", "default"])
+        .output()
+        .is_ok_and(|o| {
+            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("interface:")
+        })
+}
+
 /// The interface carrying the default route, e.g. en0.
 fn default_interface() -> io::Result<String> {
     let out = Command::new("route")
@@ -309,34 +325,49 @@ struct BoundInterface(u32);
 
 impl SocketProtector for BoundInterface {
     fn protect(&self, fd: i32) -> bool {
-        // SAFETY: sockaddr_storage is plain data; getsockname reports the family.
-        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        if unsafe {
-            libc::getsockname(
-                fd,
-                (&mut storage as *mut libc::sockaddr_storage).cast(),
-                &mut len,
-            )
-        } < 0
-        {
-            return false;
-        }
-        let (level, option) = match i32::from(storage.ss_family) {
-            libc::AF_INET6 => (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF),
-            _ => (libc::IPPROTO_IP, libc::IP_BOUND_IF),
+        // Try the option matching the socket's family first, then the other:
+        // a fresh, unbound socket may not report its family reliably.
+        let v6_first = socket_family(fd) == Some(libc::AF_INET6);
+        let options = [
+            (libc::IPPROTO_IP, libc::IP_BOUND_IF),
+            (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF),
+        ];
+        let order = if v6_first {
+            [options[1], options[0]]
+        } else {
+            options
         };
-        let index = self.0 as libc::c_int;
-        // SAFETY: the option value is a c_int of the stated size.
-        unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                option,
-                (&index as *const libc::c_int).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            ) == 0
-        }
+        order
+            .iter()
+            .any(|&(level, option)| bind_to_interface(fd, level, option, self.0))
+    }
+}
+
+fn socket_family(fd: i32) -> Option<i32> {
+    // SAFETY: sockaddr_storage is plain data; getsockname fills it.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            (&mut storage as *mut libc::sockaddr_storage).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(i32::from(storage.ss_family))
+}
+
+fn bind_to_interface(fd: i32, level: i32, option: i32, ifindex: u32) -> bool {
+    let index = ifindex as libc::c_int;
+    // SAFETY: the option value is a c_int of the stated size.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            option,
+            (&index as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0
     }
 }
 
@@ -474,6 +505,40 @@ impl EventSink for Tee {
     fn tick(&self) {
         if let Some(spool) = &self.spool {
             spool.tick();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    /// Pinning needs no root, so it can be checked without the live run.
+    #[test]
+    fn pins_ipv4_and_ipv6_sockets_to_an_interface() {
+        let lo0 = if_index("lo0").unwrap();
+        let protector = BoundInterface(lo0);
+        for (domain, proto) in [
+            (libc::AF_INET, libc::IPPROTO_TCP),
+            (libc::AF_INET6, libc::IPPROTO_TCP),
+            (libc::AF_INET, libc::IPPROTO_UDP),
+            (libc::AF_INET6, libc::IPPROTO_UDP),
+        ] {
+            let ty = if proto == libc::IPPROTO_TCP {
+                libc::SOCK_STREAM
+            } else {
+                libc::SOCK_DGRAM
+            };
+            // SAFETY: plain socket(2); wrapped so it closes on drop.
+            let fd = unsafe { libc::socket(domain, ty, proto) };
+            assert!(fd >= 0);
+            let owned =
+                unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+            assert!(
+                protector.protect(owned.as_raw_fd()),
+                "family {domain} proto {proto}"
+            );
         }
     }
 }
