@@ -1,0 +1,38 @@
+# cargo-fuzz targets for the parsers. Needs a nightly toolchain:
+#   cargo +nightly fuzz run dns -- -max_total_time=60
+# Kept out of the main workspace so stable builds never see libfuzzer.
+[package]
+name = "flynn-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+flynn-proto = { path = "../flynn-proto" }
+
+[workspace]
+
+[[bin]]
+name = "ip"
+path = "fuzz_targets/ip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls"
+path = "fuzz_targets/tls.rs"
+test = false
+doc = false
+bench = false

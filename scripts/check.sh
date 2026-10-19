@@ -18,9 +18,24 @@ cargo clippy --workspace --all-targets --quiet -- -D warnings
 step "Rust: tests"
 cargo test --workspace --quiet
 
+step "Replay fixture: synthetic-basic"
+cargo run --quiet -p flynn-harness -- replay fixtures/synthetic-basic.pcap \
+    --block tracker.test --expect fixtures/synthetic-basic.expected.txt >/dev/null
+
+# Deeper than the property tests; needs nightly and cargo-fuzz, so optional.
+if cargo +nightly fuzz --version >/dev/null 2>&1; then
+    for target in ip dns tls; do
+        step "Fuzz: $target (${FLYNN_FUZZ_SECS:-20}s)"
+        (cd "$CORE/fuzz" && cargo +nightly fuzz run "$target" -- -max_total_time="${FLYNN_FUZZ_SECS:-20}" >/dev/null 2>&1)
+    done
+else
+    step "Fuzz: skipped (install with: rustup toolchain install nightly && cargo install cargo-fuzz)"
+fi
+
 # Android is Phase 2, but the core must keep compiling for it from day one.
 step "Rust: compile for Android (aarch64-linux-android)"
-cargo check --workspace --target aarch64-linux-android --quiet
+# The harness is a macOS tool; everything that ships must build for Android.
+cargo check --workspace --exclude flynn-harness --target aarch64-linux-android --quiet
 
 cd "$ROOT"
 

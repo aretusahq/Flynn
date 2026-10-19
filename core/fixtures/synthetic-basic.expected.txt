@@ -1,0 +1,9 @@
+flows: 8  skipped packets: 2
+#1 udp 10.0.0.2:50001 -> 10.0.0.1:53 name=- verdict=allow up=1p/33B down=1p/49B
+#2 tcp 10.0.0.2:50100 -> 93.184.216.34:443 name=www.example.com (sni) verdict=allow up=6p/1780B down=5p/3000B
+#3 udp 10.0.0.2:50002 -> 10.0.0.1:53 name=- verdict=allow up=1p/34B down=1p/77B
+#4 tcp 10.0.0.2:50101 -> 203.0.113.7:443 name=ads.tracker.test (sni) verdict=block up=5p/77B down=3p/200B
+#5 tcp 10.0.0.2:50102 -> 198.51.100.20:80 name=- verdict=allow up=5p/39B down=3p/512B
+#6 udp 10.0.0.2:60000 -> 93.184.216.34:443 name=www.example.com (dns) verdict=allow quic up=1p/1200B down=1p/900B
+#7 udp [fd00::2]:50003 -> [fd00::1]:53 name=- verdict=allow up=1p/32B down=1p/60B
+#8 tcp [fd00::2]:50104 -> [2001:db8::443]:443 name=api.example.org (sni) verdict=allow up=5p/76B down=3p/100B

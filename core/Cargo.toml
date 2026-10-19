@@ -10,6 +10,7 @@ members = [
     "flynn-ffi",
     "flynn-harness",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,6 +28,12 @@ flynn-store = { path = "flynn-store" }
 flynn-enrich = { path = "flynn-enrich" }
 thiserror = "2"
 uniffi = "0.32"
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+mio = { version = "1.2", features = ["os-poll", "net"] }
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+proptest = "1"
+ctrlc = "3"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -99,7 +99,7 @@ Each one ends with its exit criteria. "Human:" marks steps Claude can't do.
 - **Human:** enrol in the Apple Developer Program, register bundle IDs, the App Group and Network Extension capabilities (packet-tunnel-provider, content-filter-provider), and give Claude the Team ID. Steps are in `docs/device-checklists.md`.
 - Exit: `scripts/check.sh` passes (including the core compiling for `aarch64-linux-android` and Kotlin bindings generating), and the empty app plus extensions build for a device.
 
-### M1 — Spike A: forwarder on the host (highest risk in the build)
+### M1 — Spike A: forwarder on the host (highest risk in the build) (code done 19 Oct; live run pending)
 - `flynn-proto` parsers for IPv4/IPv6/TCP/UDP/DNS/SNI, with fuzz targets.
 - `flynn-dataplane` forwarder: smoltcp terminates TCP locally and opens matching outbound sockets. UDP is relayed with flow timeouts. DNS is intercepted and logged.
 - `flynn-harness`: pcap replay to check the parsers and flow accounting, plus a live `utun` mode that routes the Mac's traffic through the forwarder.

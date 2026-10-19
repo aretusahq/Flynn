@@ -12,6 +12,8 @@ flynn-types.workspace = true
 flynn-proto.workspace = true
 flynn-rules.workspace = true
 flynn-dataplane.workspace = true
+libc.workspace = true
+ctrlc.workspace = true
 
 [lints]
 workspace = true
