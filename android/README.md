@@ -7,7 +7,7 @@ What Phase 2 adds here:
 
 - A Gradle project with a Kotlin `VpnService` that implements the host
   traits from `core/flynn-dataplane/src/host.rs` through the generated
-  Kotlin bindings (package `com.kasunben.flynn.core`):
+  Kotlin bindings (package `io.aretusa.flynn.core`):
   `HostPacketIo` over the TUN file descriptor, `HostSocketProtector` calling
   `VpnService.protect(fd)`, and `HostAppResolver` using
   `ConnectivityManager.getConnectionOwnerUid`.
