@@ -1,0 +1,17 @@
+[package]
+name = "flynn-harness"
+description = "Host harness: pcap replay, live utun runs and measurements on macOS."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+flynn-types.workspace = true
+flynn-proto.workspace = true
+flynn-rules.workspace = true
+flynn-dataplane.workspace = true
+
+[lints]
+workspace = true

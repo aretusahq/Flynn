@@ -1,0 +1,152 @@
+# XcodeGen spec for the Flynn iOS and iPadOS app. Generate the project with
+# `scripts/bootstrap.sh` (or `xcodegen` in this directory after building the
+# XCFramework). Flynn.xcodeproj is generated and not committed.
+#
+# Signing: put `DEVELOPMENT_TEAM = <your team id>` in
+# Config/Signing.local.xcconfig (git-ignored).
+
+name: Flynn
+
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+configFiles:
+  Debug: Config/Base.xcconfig
+  Release: Config/Base.xcconfig
+
+packages:
+  FlynnKit:
+    path: FlynnKit
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  Flynn:
+    type: application
+    platform: iOS
+    sources: [Flynn]
+    dependencies:
+      - package: FlynnKit
+      - target: FlynnTunnel
+      - target: FlynnFilterData
+      - target: FlynnFilterControl
+    info:
+      path: Flynn/Info.plist
+      properties:
+        CFBundleDisplayName: Flynn
+        FlynnAppGroup: $(FLYNN_APP_GROUP)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    entitlements:
+      path: Flynn/Flynn.entitlements
+      properties:
+        com.apple.security.application-groups: [$(FLYNN_APP_GROUP)]
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
+          - content-filter-provider
+        keychain-access-groups: [$(AppIdentifierPrefix)$(FLYNN_KEYCHAIN_GROUP)]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(FLYNN_BUNDLE_PREFIX)
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  FlynnTunnel:
+    type: app-extension
+    platform: iOS
+    sources: [FlynnTunnel]
+    dependencies:
+      - package: FlynnKit
+    info:
+      path: FlynnTunnel/Info.plist
+      properties:
+        CFBundleDisplayName: Flynn Tunnel
+        FlynnAppGroup: $(FLYNN_APP_GROUP)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+    entitlements:
+      path: FlynnTunnel/FlynnTunnel.entitlements
+      properties:
+        com.apple.security.application-groups: [$(FLYNN_APP_GROUP)]
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        keychain-access-groups: [$(AppIdentifierPrefix)$(FLYNN_KEYCHAIN_GROUP)]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(FLYNN_BUNDLE_PREFIX).tunnel
+
+  FlynnFilterData:
+    type: app-extension
+    platform: iOS
+    sources: [FlynnFilterData]
+    dependencies:
+      - package: FlynnKit
+    info:
+      path: FlynnFilterData/Info.plist
+      properties:
+        CFBundleDisplayName: Flynn Filter Data
+        FlynnAppGroup: $(FLYNN_APP_GROUP)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.filter-data
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FilterDataProvider
+    entitlements:
+      path: FlynnFilterData/FlynnFilterData.entitlements
+      properties:
+        com.apple.security.application-groups: [$(FLYNN_APP_GROUP)]
+        com.apple.developer.networking.networkextension: [content-filter-provider]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(FLYNN_BUNDLE_PREFIX).filter-data
+
+  FlynnFilterControl:
+    type: app-extension
+    platform: iOS
+    sources: [FlynnFilterControl]
+    dependencies:
+      - package: FlynnKit
+    info:
+      path: FlynnFilterControl/Info.plist
+      properties:
+        CFBundleDisplayName: Flynn Filter Control
+        FlynnAppGroup: $(FLYNN_APP_GROUP)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.filter-control
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FilterControlProvider
+    entitlements:
+      path: FlynnFilterControl/FlynnFilterControl.entitlements
+      properties:
+        com.apple.security.application-groups: [$(FLYNN_APP_GROUP)]
+        com.apple.developer.networking.networkextension: [content-filter-provider]
+        keychain-access-groups: [$(AppIdentifierPrefix)$(FLYNN_KEYCHAIN_GROUP)]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(FLYNN_BUNDLE_PREFIX).filter-control
+
+schemes:
+  Flynn:
+    build:
+      targets:
+        Flynn: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - package: FlynnKit/FlynnKitTests
+    archive:
+      config: Release

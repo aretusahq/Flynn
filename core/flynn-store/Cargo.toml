@@ -1,0 +1,15 @@
+[package]
+name = "flynn-store"
+description = "History, rollups, retention and explorer queries. Runs in the app process only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+flynn-types.workspace = true
+flynn-rules.workspace = true
+
+[lints]
+workspace = true

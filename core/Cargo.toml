@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = [
+    "flynn-types",
+    "flynn-proto",
+    "flynn-rules",
+    "flynn-dataplane",
+    "flynn-store",
+    "flynn-enrich",
+    "flynn-ffi",
+    "flynn-harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MPL-2.0"
+publish = false
+
+[workspace.dependencies]
+flynn-types = { path = "flynn-types" }
+flynn-proto = { path = "flynn-proto" }
+flynn-rules = { path = "flynn-rules" }
+flynn-dataplane = { path = "flynn-dataplane" }
+flynn-store = { path = "flynn-store" }
+flynn-enrich = { path = "flynn-enrich" }
+thiserror = "2"
+uniffi = "0.32"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+# Extensions run under a hard memory ceiling; keep binaries small.
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+strip = "debuginfo"

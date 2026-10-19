@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Rust
+/core/target/
+/core/fuzz/target/
+/core/fuzz/corpus/
+/core/fuzz/artifacts/
+
+# Build outputs (XCFramework, generated bindings)
+/build/
+
+# Xcode (the project is generated from apple/project.yml by XcodeGen)
+/apple/*.xcodeproj/
+/apple/FlynnKit/FlynnCore.xcframework/
+/apple/FlynnKit/Sources/FlynnKit/Generated/
+/apple/FlynnKit/.build/
+/apple/FlynnKit/.swiftpm/
+/apple/Config/Signing.local.xcconfig
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Android (Phase 2)
+/android/.gradle/
+/android/build/
+/android/local.properties

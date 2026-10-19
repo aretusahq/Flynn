@@ -1,0 +1,32 @@
+[package]
+name = "flynn-ffi"
+description = "UniFFI bindings: the DataPlane facade for capture extensions and the Library facade for apps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "flynn_ffi"
+# staticlib for iOS (XCFramework), cdylib for Android (jniLibs) and for
+# generating bindings in library mode, lib for Rust tests.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+flynn-types.workspace = true
+flynn-rules.workspace = true
+flynn-dataplane.workspace = true
+flynn-store.workspace = true
+uniffi.workspace = true
+
+[lints]
+workspace = true

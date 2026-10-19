@@ -1,0 +1,9 @@
+// Shared build settings for every Flynn target.
+
+// One place for the bundle prefix; the App Group and Keychain group follow it.
+FLYNN_BUNDLE_PREFIX = com.kasunben.flynn
+FLYNN_APP_GROUP = group.$(FLYNN_BUNDLE_PREFIX)
+FLYNN_KEYCHAIN_GROUP = $(FLYNN_BUNDLE_PREFIX).shared
+
+// Signing. DEVELOPMENT_TEAM lives in the git-ignored local file.
+#include? "Signing.local.xcconfig"

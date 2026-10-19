@@ -1,0 +1,17 @@
+[package]
+name = "flynn-dataplane"
+description = "Flow tracking, verdicts and the userspace forwarder. Runs inside the capture extension."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+flynn-types.workspace = true
+flynn-proto.workspace = true
+flynn-rules.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
