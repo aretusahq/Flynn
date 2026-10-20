@@ -409,9 +409,14 @@ struct Totals {
     normal: u64,
     reset: u64,
     idle: u64,
+    /// Each flow counts once, by its final name source: a flow named by
+    /// DNS at open and then by SNI counts as SNI.
     named_dns: u64,
     named_sni: u64,
     unnamed: u64,
+    /// Open flows still counted under DNS or unnamed, until SNI or close.
+    open_dns: std::collections::HashSet<u64>,
+    open_unnamed: std::collections::HashSet<u64>,
 }
 
 struct Printer {
@@ -422,6 +427,11 @@ struct Printer {
 impl EventSink for Printer {
     fn emit(&self, event: Event) {
         if let Ok(mut t) = self.totals.lock() {
+            // A closed flow keeps its count; stop tracking it.
+            if let Event::FlowClosed { id, .. } = &event {
+                t.open_dns.remove(id);
+                t.open_unnamed.remove(id);
+            }
             match &event {
                 Event::FlowClosed {
                     reason: CloseReason::Normal,
@@ -435,9 +445,24 @@ impl EventSink for Printer {
                     reason: CloseReason::Idle,
                     ..
                 } => t.idle += 1,
-                Event::FlowOpened { name: Some(_), .. } => t.named_dns += 1,
-                Event::FlowOpened { name: None, .. } => t.unnamed += 1,
-                Event::FlowNamed { .. } => t.named_sni += 1,
+                Event::FlowOpened {
+                    id, name: Some(_), ..
+                } => {
+                    t.named_dns += 1;
+                    t.open_dns.insert(*id);
+                }
+                Event::FlowOpened { id, name: None, .. } => {
+                    t.unnamed += 1;
+                    t.open_unnamed.insert(*id);
+                }
+                Event::FlowNamed { id, .. } => {
+                    if t.open_dns.remove(id) {
+                        t.named_dns -= 1;
+                    } else if t.open_unnamed.remove(id) {
+                        t.unnamed -= 1;
+                    }
+                    t.named_sni += 1;
+                }
                 _ => {}
             }
         }

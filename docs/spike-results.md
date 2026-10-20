@@ -19,9 +19,26 @@ stack plays the app, servers on 127.0.0.1 stand in for the internet.
   two-segment ClientHello is reassembled and its server name blocked; DNS
   answers name later connections; lockdown blocks at open.
 
-### Live utun run
+### 19 Oct 2026 · live utun, one route · MacBook (Wi-Fi en0, IPv4 only) · release build
 
-Pending: needs `sudo`; steps in [device-checklists.md](device-checklists.md#m1--forwarder-on-the-mac-needs-sudo).
+Step 1 of the live run: only 1.1.1.1/32 routed into utun6.
+
+- `curl -sI https://1.1.1.1`: relayed and closed normally (567 B up,
+  2791 B down). No name, as expected: curl sends no SNI for a bare address.
+- `curl -sI --resolve one.one.one.one:443:1.1.1.1 https://one.one.one.one`:
+  `HTTP/2 200` through the forwarder; the flow was named `one.one.one.one`
+  from the ClientHello; closed normally (597 B up, 3619 B down).
+- Outbound sockets pinned to en0 with IP_BOUND_IF did not loop back into
+  the tunnel.
+- 4 non-TCP/UDP packets dropped before any test traffic: macOS's own
+  housekeeping on the new interface.
+- Harness footprint 1.6 MiB, CPU about 0.1% of one core when idle.
+- Found and fixed: the summary counted a flow named late by SNI as both
+  unnamed and SNI-named. Each flow now counts once, by its final name source.
+
+### Live utun run, all traffic
+
+Pending: steps 2 to 4 in [device-checklists.md](device-checklists.md#m1--forwarder-on-the-mac-needs-sudo).
 Record throughput against no-tunnel, peak footprint, CPU share, and anything
 that broke.
 
