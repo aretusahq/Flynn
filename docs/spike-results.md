@@ -57,11 +57,46 @@ Bearing on iOS: none expected. Network Extension sockets bypass their own
 tunnel without IP_BOUND_IF, but the virtual-DNS and include-all-networks
 experiments in M2 should keep this failure mode in mind.
 
-### Live utun run, all traffic
+### 19 Oct 2026 · live utun, all traffic · same Mac · default buffers (16/32 KiB)
 
-Pending: steps 2 to 4 in [device-checklists.md](device-checklists.md#m1--forwarder-on-the-mac-needs-sudo).
-Record throughput against no-tunnel, peak footprint, CPU share, and anything
-that broke.
+Step 2 rerun with the fixed routes: 520 s of normal use (browsing, Instagram,
+a large download).
+
+| Measure | Result |
+| --- | --- |
+| Flows | 94 opened, 0 connect failures, 0 blocked |
+| Relayed | 0.8 MB up, 255.6 MB down |
+| Peak, 5 s window | 241.9 Mb/s down, on one TCP flow (236 MB from proton.me) |
+| CPU | 2.4 s total, 0.5% of a core on average; about 20% of a core at the 240 Mb/s peak |
+| Footprint | 4.1 MiB peak for the whole harness process, flat once flows settled |
+| Closes | 15 normal, 23 reset, 42 idle (UDP) |
+| Packets | 18,941 in, 183,029 out, 4 dropped (macOS housekeeping) |
+
+Naming, from the spool:
+
+- 48 of 94 flows named from the TLS server name.
+- 46 unnamed: 39 are QUIC (UDP 443), 3 NTP, 2 DNS, 1 plain HTTP, and 1 TLS
+  flow without a name.
+- Only 2 DNS queries crossed the tunnel. The Mac's first resolver,
+  192.168.50.10, is on the LAN, and the LAN route is more specific than the
+  tunnel's, so most lookups never reached Flynn. The two that did (to the
+  1.1.1.1 fallback) were decoded and cached correctly.
+- The 23 resets were all TCP flows to browsing sites (Instagram CDN, Google,
+  gallery sites). This looks like browsers abandoning pre-opened
+  connections, not a forwarder fault, but a packet capture would be needed
+  to confirm.
+
+What it decides:
+
+- The forwarder carries real traffic at well over 200 Mb/s on default buffers
+  at modest CPU. The iPhone figure is still to measure in M2.
+- Reading the QUIC server name moves up in M4: QUIC is most of what is
+  unnamed now.
+- DNS visibility depends on where the resolver sits. On iOS the M2 checklist
+  already tests the virtual-resolver switch; also test routing a LAN
+  resolver's address into the tunnel, or include-all-networks.
+
+Steps 3 (blocking) and 4 (speed against tunnel-off) still to run.
 
 ## M2 — Packet tunnel on the iPhone
 

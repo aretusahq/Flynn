@@ -125,6 +125,9 @@ Each one ends with its exit criteria. "Human:" marks steps Claude can't do.
 - `flynn-rules`: rules by app, domain (exact and `*.` wildcard), host, IP/CIDR and port. Precedence is block over allow, specific over general, then mode default. A versioned snapshot format, property tests for precedence, and a bundled essentials list (Apple push, captive portal, time, OCSP).
 - Flow table with an LRU cap, coalescing of repeated connections (one row + a counter, a lever from the doc), and batched spool writes.
 - Hot rule reload through the provider message.
+- QUIC Initial decryption to read the server name (HKDF and AES-GCM over the
+  Initial keys). Moved up after the M1 live run, where QUIC was 39 of the
+  46 unnamed flows.
 - Exit: rule-evaluation property tests pass, the parser fuzzers run clean for N minutes, and replaying a fixed pcap gives the same verdicts as a checked-in expected file.
 
 ### M5 — Store, enrichment, detection
