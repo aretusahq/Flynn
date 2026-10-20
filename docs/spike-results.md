@@ -96,7 +96,29 @@ What it decides:
   already tests the virtual-resolver switch; also test routing a LAN
   resolver's address into the tunnel, or include-all-networks.
 
-Steps 3 (blocking) and 4 (speed against tunnel-off) still to run.
+### 20 Oct 2026 · live utun, blocking · same Mac
+
+Step 3: `--all --block example.com`, then https://example.com in Safari.
+**The page loaded: the block did not apply.**
+
+- No flow named example.com appeared. Safari reached it over QUIC: flow #3,
+  UDP to 172.66.147.243:443, which is example.com's current address.
+- That flow had no name. QUIC carries the server name inside an encrypted
+  Initial packet, which Flynn cannot read yet, and Safari's DNS lookup went
+  to the LAN resolver, outside the tunnel.
+- Not iCloud Private Relay: its relays are at 17.248.x; no flow went there.
+- In the same 25 s, a 236 MB download peaked at 371.7 Mb/s (5 s window), at
+  about 26% of one core, with a 2.2 MiB footprint.
+
+What it decides: blocking by name is unreliable until QUIC flows can be
+named. Two fixes, which are complementary:
+
+1. Read the server name from the QUIC Initial (planned for M4).
+2. Policy fallback: drop UDP 443 to a destination with no name, so browsers
+   fall back to TCP, where the TLS server name is readable. It costs a
+   little speed on first connection.
+
+Step 4 (speed against tunnel-off) still to run.
 
 ## M2 — Packet tunnel on the iPhone
 
