@@ -31,6 +31,26 @@ pub struct LiveOptions {
     pub spool: Option<std::path::PathBuf>,
 }
 
+/// Everything except 0.0.0.0/8. macOS resolves a socket pinned with
+/// IP_BOUND_IF through the default route when the interface has no scoped
+/// one, and finds that default by looking up 0.0.0.0. A route covering
+/// 0.0.0.0 (such as the usual 0.0.0.0/1 split) captures that lookup, so
+/// every pinned socket resolves to the tunnel and fails to connect.
+const ALL_IPV4: [&str; 8] = [
+    "1.0.0.0/8",
+    "2.0.0.0/7",
+    "4.0.0.0/6",
+    "8.0.0.0/5",
+    "16.0.0.0/4",
+    "32.0.0.0/3",
+    "64.0.0.0/2",
+    "128.0.0.0/1",
+];
+
+/// Global unicast only, which leaves `::` (and link-local) alone for the
+/// same reason.
+const ALL_IPV6: [&str; 1] = ["2000::/3"];
+
 const TUN_V4: &str = "10.111.0.1";
 const TUN_V4_PEER: &str = "10.111.0.2";
 const TUN_V6: &str = "fd00:f1::1";
@@ -63,11 +83,11 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
     )?;
     let mut routes = opts.routes.clone();
     if opts.all {
-        routes.extend(["0.0.0.0/1", "128.0.0.0/1"].map(String::from));
+        routes.extend(ALL_IPV4.map(String::from));
         // Claiming IPv6 on a Mac without IPv6 connectivity would make apps
         // try IPv6 first and fail through us; only route it when it works.
         if has_ipv6_default_route() {
-            routes.extend(["::/1", "8000::/1"].map(String::from));
+            routes.extend(ALL_IPV6.map(String::from));
         } else {
             println!("no IPv6 default route: routing IPv4 only");
         }
@@ -95,6 +115,19 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
             ],
         )?;
         println!("route: {cidr} -> {}", utun.name);
+    }
+
+    // Our own sockets must still leave through the physical interface.
+    // Check once before relaying anything, so a routing problem shows up
+    // here rather than as thousands of failed flows.
+    match self_check(&BoundInterface(ifindex)) {
+        Ok(()) => println!("self-check: a socket pinned to {physical} reaches the internet"),
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "self-check failed: a socket pinned to {physical} cannot reach 1.1.1.1:443 ({e}). \
+                 The routes would loop the forwarder into its own tunnel; stopping."
+            )));
+        }
     }
 
     let stopping = Arc::new(AtomicBool::new(false));
@@ -254,6 +287,23 @@ fn sh(cmd: &str, args: &[&str]) -> io::Result<()> {
             args.join(" ")
         )))
     }
+}
+
+/// Connects a pinned socket to 1.1.1.1:443 and closes it.
+fn self_check(protector: &dyn SocketProtector) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let target: std::net::SocketAddr = "1.1.1.1:443".parse().map_err(io::Error::other)?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    if !protector.protect(socket.as_raw_fd()) {
+        return Err(io::Error::other(
+            "could not pin the socket to the interface",
+        ));
+    }
+    socket.connect_timeout(&target.into(), Duration::from_secs(3))
 }
 
 fn has_ipv6_default_route() -> bool {
@@ -540,6 +590,31 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     /// Pinning needs no root, so it can be checked without the live run.
+    #[test]
+    fn all_routes_cover_ipv4_except_zero_slash_eight() {
+        let mut covered: u64 = 0;
+        for cidr in ALL_IPV4 {
+            let (net, len) = cidr.split_once('/').unwrap();
+            let len: u32 = len.parse().unwrap();
+            let net: std::net::Ipv4Addr = net.parse().unwrap();
+            assert_ne!(
+                net.octets()[0],
+                0,
+                "{cidr} would capture the 0.0.0.0 default lookup"
+            );
+            covered += 1u64 << (32 - len);
+        }
+        assert_eq!(covered, (1u64 << 32) - (1u64 << 24));
+    }
+
+    /// Needs network access but not root: what the live self-check does.
+    #[test]
+    #[ignore = "touches the network"]
+    fn self_check_passes_on_the_default_interface() {
+        let iface = default_interface().unwrap();
+        self_check(&BoundInterface(if_index(&iface).unwrap())).unwrap();
+    }
+
     #[test]
     fn pins_ipv4_and_ipv6_sockets_to_an_interface() {
         let lo0 = if_index("lo0").unwrap();

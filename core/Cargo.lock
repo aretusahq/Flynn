@@ -388,6 +388,7 @@ dependencies = [
  "flynn-rules",
  "flynn-types",
  "libc",
+ "socket2",
 ]
 
 [[package]]

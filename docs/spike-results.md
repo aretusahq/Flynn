@@ -36,6 +36,27 @@ Step 1 of the live run: only 1.1.1.1/32 routed into utun6.
 - Found and fixed: the summary counted a flow named late by SNI as both
   unnamed and SNI-named. Each flow now counts once, by its final name source.
 
+### 19 Oct 2026 · live utun, all traffic, first attempt · same Mac
+
+Step 2 with `--all` (routes 0.0.0.0/1 and 128.0.0.0/1): every one of 2,370
+flows failed to connect within a millisecond; nothing was relayed. The
+forwarder behaved correctly (each refusal reached the app as a reset), but
+its own outbound sockets could not leave.
+
+Cause: the Mac had no default route scoped to en0, only the global one. A
+socket pinned with IP_BOUND_IF then falls back to the default route, which
+macOS finds by looking up 0.0.0.0, and 0.0.0.0/1 captured that lookup, so
+every pinned socket resolved to the utun and failed. Step 1's 1.1.1.1/32
+route did not cover 0.0.0.0, which is why it worked.
+
+Fix: `--all` now routes 1.0.0.0/8 … 128.0.0.0/1 (all of IPv4 except
+0.0.0.0/8), and IPv6 as 2000::/3. Live mode also checks at start that a
+pinned socket reaches 1.1.1.1:443 and stops if it cannot.
+
+Bearing on iOS: none expected. Network Extension sockets bypass their own
+tunnel without IP_BOUND_IF, but the virtual-DNS and include-all-networks
+experiments in M2 should keep this failure mode in mind.
+
 ### Live utun run, all traffic
 
 Pending: steps 2 to 4 in [device-checklists.md](device-checklists.md#m1--forwarder-on-the-mac-needs-sudo).
