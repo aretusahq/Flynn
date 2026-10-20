@@ -12,6 +12,9 @@ public struct TunnelOptions: Codable, Equatable, Sendable {
     public var blockedDomains: [String] = []
     public var recvBufferKiB: UInt32 = 16
     public var sendBufferKiB: UInt32 = 32
+    /// Drop QUIC flows whose server name cannot be read, so apps retry over
+    /// TCP, where the name is visible and rules can match it.
+    public var forceTCPForUnnamedQUIC = false
 
     // Spike switches, applied by the app to the VPN configuration.
     /// Route all traffic, including what iOS would otherwise exempt.
@@ -27,6 +30,23 @@ public struct TunnelOptions: Codable, Equatable, Sendable {
     public var upstreamDNS = ""
 
     public init() {}
+
+    /// Missing keys keep their defaults, so options saved by an older build
+    /// survive a new field.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = TunnelOptions()
+        mode = try c.decodeIfPresent(Mode.self, forKey: .mode) ?? d.mode
+        blockedDomains = try c.decodeIfPresent([String].self, forKey: .blockedDomains) ?? d.blockedDomains
+        recvBufferKiB = try c.decodeIfPresent(UInt32.self, forKey: .recvBufferKiB) ?? d.recvBufferKiB
+        sendBufferKiB = try c.decodeIfPresent(UInt32.self, forKey: .sendBufferKiB) ?? d.sendBufferKiB
+        forceTCPForUnnamedQUIC = try c.decodeIfPresent(Bool.self, forKey: .forceTCPForUnnamedQUIC) ?? d.forceTCPForUnnamedQUIC
+        includeAllNetworks = try c.decodeIfPresent(Bool.self, forKey: .includeAllNetworks) ?? d.includeAllNetworks
+        enforceRoutes = try c.decodeIfPresent(Bool.self, forKey: .enforceRoutes) ?? d.enforceRoutes
+        onDemand = try c.decodeIfPresent(Bool.self, forKey: .onDemand) ?? d.onDemand
+        useVirtualDNS = try c.decodeIfPresent(Bool.self, forKey: .useVirtualDNS) ?? d.useVirtualDNS
+        upstreamDNS = try c.decodeIfPresent(String.self, forKey: .upstreamDNS) ?? d.upstreamDNS
+    }
 
     public static let providerKey = "options"
     public static let virtualDNS = "10.111.0.53"
@@ -56,6 +76,7 @@ public struct TunnelOptions: Codable, Equatable, Sendable {
         s.blockedDomains = blockedDomains
         s.tcpRecvBufferKib = recvBufferKiB
         s.tcpSendBufferKib = sendBufferKiB
+        s.forceTcpForUnnamedQuic = forceTCPForUnnamedQUIC
         let upstream = upstreamDNS.trimmingCharacters(in: .whitespaces)
         if useVirtualDNS, !upstream.isEmpty {
             let host = upstream.contains(":") && !upstream.hasPrefix("[") ? "[\(upstream)]" : upstream

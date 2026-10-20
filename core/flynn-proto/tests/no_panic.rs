@@ -15,6 +15,8 @@ fn parse_all(data: &[u8]) {
     let _ = dns::parse(data);
     let _ = tls::client_hello_sni(data);
     let _ = quic::initial_version(data);
+    let _ = quic::InitialSniffer::new().feed(data);
+    let _ = tls::handshake_sni(data);
 }
 
 proptest! {
@@ -48,6 +50,19 @@ proptest! {
         }
         let end = h.len().saturating_sub(cut % h.len());
         let _ = tls::client_hello_sni(&h[..end]);
+    }
+
+    /// Flipped bytes in a real Initial: header parsing and frame walking
+    /// must survive whatever decrypts, and authentication rejects the rest.
+    #[test]
+    fn mutated_quic_initial(flips in proptest::collection::vec((0usize..1200, any::<u8>()), 1..6), cut in 0usize..1200) {
+        let mut d = include_bytes!("../../fixtures/quic/apple-initial-0.bin").to_vec();
+        for (at, b) in flips {
+            let i = at % d.len();
+            d[i] = b;
+        }
+        let end = d.len() - cut % d.len();
+        let _ = quic::InitialSniffer::new().feed(&d[..end]);
     }
 
     #[test]

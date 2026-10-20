@@ -34,6 +34,10 @@ socket2 = { version = "0.6", features = ["all"] }
 libc = "0.2"
 proptest = "1"
 ctrlc = "3"
+aes = "0.9"
+aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
+hkdf = "0.13"
+sha2 = { version = "0.11", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

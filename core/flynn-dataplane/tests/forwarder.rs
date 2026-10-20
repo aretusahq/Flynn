@@ -29,6 +29,7 @@ const ECHO: &str = "198.51.100.1:7";
 const TLS: &str = "198.51.100.1:443";
 const DNS: &str = "198.51.100.53:53";
 const REFUSED: &str = "198.51.100.9:9";
+const QUIC: &str = "198.51.100.1:443";
 
 // ----- Host stubs -----------------------------------------------------------
 
@@ -148,6 +149,21 @@ fn dns_server() -> SocketAddr {
     addr
 }
 
+/// Records every datagram it receives, in order.
+fn udp_recorder() -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, _)) = socket.recv_from(&mut buf) {
+            log.lock().unwrap().push(buf[..n].to_vec());
+        }
+    });
+    (addr, seen)
+}
+
 /// A port nothing listens on.
 fn refused_port() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -213,6 +229,10 @@ struct Rig {
 
 impl Rig {
     fn new(policy: Arc<dyn Policy>) -> Self {
+        Self::with(policy, |_| {})
+    }
+
+    fn with(policy: Arc<dyn Policy>, tweak: impl FnOnce(&mut ForwarderConfig)) -> Self {
         let to_app = Arc::new(ToApp::default());
         let events = Arc::new(Collect::default());
         let host = Host {
@@ -230,6 +250,7 @@ impl Rig {
             (DNS.parse().unwrap(), dns_server()),
             (REFUSED.parse().unwrap(), refused_port()),
         ]);
+        tweak(&mut config);
         let fwd = forwarder::spawn(host, config, events.clone()).unwrap();
 
         let mut device = AppDevice::default();
@@ -311,6 +332,12 @@ impl Rig {
 
     fn send_udp(&mut self, dst: &str, payload: &[u8]) {
         let src: SocketAddr = (std::net::Ipv4Addr::from(APP_IP), 5353).into();
+        let packet = build::udp_packet(src, dst.parse().unwrap(), payload);
+        self.fwd.as_ref().unwrap().push_packets([packet]);
+    }
+
+    fn send_udp_from(&mut self, port: u16, dst: &str, payload: &[u8]) {
+        let src: SocketAddr = (std::net::Ipv4Addr::from(APP_IP), port).into();
         let packet = build::udp_packet(src, dst.parse().unwrap(), payload);
         self.fwd.as_ref().unwrap().push_packets([packet]);
     }
@@ -489,5 +516,97 @@ fn lockdown_blocks_at_open() {
         .collect();
     assert_eq!(verdicts, vec![Verdict::Block]);
     assert_eq!(rig.events.closed(), vec![(0, 0, CloseReason::Blocked)]);
+    rig.stop();
+}
+
+// ----- QUIC -----------------------------------------------------------------
+
+fn quic_rig(policy: Arc<dyn Policy>, force_tcp: bool) -> (Rig, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let (server, seen) = udp_recorder();
+    let rig = Rig::with(policy, |c| {
+        c.redirects.insert(QUIC.parse().unwrap(), server);
+        c.force_tcp_for_unnamed_quic = force_tcp;
+    });
+    (rig, seen)
+}
+
+fn initials(name: &str) -> Vec<Vec<u8>> {
+    let hello = build::client_hello(Some(name), 1500);
+    build::quic_initials(flynn_proto::quic::VERSION_1, &[9; 8], &hello[5..], 2)
+}
+
+fn closed_reasons(rig: &Rig) -> Vec<CloseReason> {
+    rig.events.closed().into_iter().map(|c| c.2).collect()
+}
+
+#[test]
+fn quic_flow_blocked_by_name_before_any_datagram_leaves() {
+    let (mut rig, seen) = quic_rig(Arc::new(DomainBlocklist::new(["blocked.test"])), false);
+    for d in initials("www.blocked.test") {
+        rig.send_udp_from(60000, QUIC, &d);
+    }
+    assert!(rig.until(Duration::from_secs(5), |r| {
+        closed_reasons(r).contains(&CloseReason::Blocked)
+    }));
+    // Retransmissions of the blocked flow are dropped without new flows.
+    for d in initials("www.blocked.test") {
+        rig.send_udp_from(60000, QUIC, &d);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    rig.pump();
+    let events = rig.events.events();
+    assert!(events.iter().any(|e| matches!(e, Event::FlowNamed { name, source: NameSource::Sni, .. } if name == "www.blocked.test")));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::FlowOpened { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a blocked QUIC flow reached the server"
+    );
+    rig.stop();
+}
+
+#[test]
+fn allowed_quic_flow_releases_held_datagrams_in_order() {
+    let (mut rig, seen) = quic_rig(Arc::new(DomainBlocklist::new(["blocked.test"])), false);
+    let sent = initials("api.example.org");
+    for d in &sent {
+        rig.send_udp_from(60001, QUIC, d);
+    }
+    assert!(rig.until(Duration::from_secs(5), |_| seen.lock().unwrap().len() == 2));
+    assert_eq!(*seen.lock().unwrap(), sent);
+    assert!(
+        rig.events
+            .events()
+            .iter()
+            .any(|e| matches!(e, Event::FlowNamed { name, .. } if name == "api.example.org"))
+    );
+    rig.stop();
+}
+
+#[test]
+fn unnamed_quic_is_dropped_only_when_forcing_tcp() {
+    // Looks like a v1 Initial but cannot be decrypted, so it stays unnamed.
+    let mut fake = vec![0xc3, 0, 0, 0, 1, 8];
+    fake.resize(1200, 0x5a);
+
+    let (mut rig, seen) = quic_rig(Arc::new(ModePolicy(Mode::AllowAll)), true);
+    rig.send_udp_from(60002, QUIC, &fake);
+    assert!(rig.until(Duration::from_secs(5), |r| {
+        closed_reasons(r).contains(&CloseReason::ForcedTcp)
+    }));
+    assert!(seen.lock().unwrap().is_empty());
+    rig.stop();
+
+    let (mut rig, seen) = quic_rig(Arc::new(ModePolicy(Mode::AllowAll)), false);
+    rig.send_udp_from(60003, QUIC, &fake);
+    assert!(
+        rig.until(Duration::from_secs(5), |_| seen.lock().unwrap().len() == 1),
+        "unnamed QUIC was not released"
+    );
     rig.stop();
 }

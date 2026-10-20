@@ -131,6 +131,25 @@ pub fn basic() -> Vec<Packet> {
     s.push(build::udp_packet(c, q, &initial));
     s.push(build::udp_packet(q, c, &[0x40; 900]));
 
+    // QUIC with real Initial protection, the ClientHello split over two
+    // datagrams: named from the Initials, and one of them blocked.
+    for (port, server, name) in [
+        (60001, "203.0.113.50:443", "video.example.net"),
+        (60002, "203.0.113.7:443", "beacon.tracker.test"),
+    ] {
+        let (c, q) = (addr(&format!("10.0.0.2:{port}")), addr(server));
+        let hello = build::client_hello(Some(name), 1500);
+        for d in build::quic_initials(
+            flynn_proto::quic::VERSION_1,
+            &[port as u8; 8],
+            &hello[5..],
+            2,
+        ) {
+            s.push(build::udp_packet(c, q, &d));
+        }
+        s.push(build::udp_packet(q, c, &[0x40; 300]));
+    }
+
     // IPv6: AAAA lookup, then a connection named by SNI that differs from DNS.
     s.dns(
         "[fd00::2]:50003",

@@ -62,6 +62,9 @@ pub enum CloseReason {
     Idle,
     /// The flow table was full.
     Capacity,
+    /// A QUIC flow with no readable name, dropped so the app retries over
+    /// TCP, where the server name is visible.
+    ForcedTcp,
     /// The data plane stopped.
     Shutdown,
 }
@@ -75,6 +78,7 @@ impl CloseReason {
             CloseReason::ConnectFailed => "connect-failed",
             CloseReason::Idle => "idle",
             CloseReason::Capacity => "capacity",
+            CloseReason::ForcedTcp => "forced-tcp",
             CloseReason::Shutdown => "shutdown",
         }
     }

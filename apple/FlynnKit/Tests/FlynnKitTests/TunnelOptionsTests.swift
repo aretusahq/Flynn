@@ -13,6 +13,20 @@ struct TunnelOptionsTests {
         #expect(restored == options)
     }
 
+    @Test func olderSavedOptionsKeepTheirValuesAndDefaultNewFields() throws {
+        let old = Data(#"{"mode":"lockdown","blockedDomains":["a.test"],"recvBufferKiB":64,"sendBufferKiB":32,"includeAllNetworks":false,"enforceRoutes":false,"onDemand":true,"useVirtualDNS":false,"upstreamDNS":""}"#.utf8)
+        let decoded = try JSONDecoder().decode(TunnelOptions.self, from: old)
+        #expect(decoded.mode == .lockdown)
+        #expect(decoded.onDemand)
+        #expect(decoded.forceTCPForUnnamedQUIC == false)
+    }
+
+    @Test func forceTCPMapsToForwarderSettings() {
+        var options = TunnelOptions()
+        options.forceTCPForUnnamedQUIC = true
+        #expect(options.forwarderSettings().forceTcpForUnnamedQuic)
+    }
+
     @Test func missingConfigurationGivesDefaults() {
         #expect(TunnelOptions(providerConfiguration: nil) == TunnelOptions())
     }

@@ -103,6 +103,7 @@ struct DebugView: View {
                     value: $controller.options.recvBufferKiB, in: 4...256, step: 4)
             Stepper("Send buffer \(controller.options.sendBufferKiB) KiB",
                     value: $controller.options.sendBufferKiB, in: 4...512, step: 8)
+            Toggle("Force TCP for unnamed QUIC", isOn: $controller.options.forceTCPForUnnamedQUIC)
             Toggle("Include all networks", isOn: $controller.options.includeAllNetworks)
             Toggle("Enforce routes", isOn: $controller.options.enforceRoutes)
             Toggle("Connect on demand", isOn: $controller.options.onDemand)
@@ -231,6 +232,7 @@ private extension CloseReason {
         case .connectFailed: "connect failed"
         case .idle: "idle"
         case .capacity: "flow table full"
+        case .forcedTcp: "QUIC unnamed, app sent to TCP"
         case .shutdown: "tunnel stopped"
         }
     }

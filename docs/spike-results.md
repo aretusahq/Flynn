@@ -118,6 +118,15 @@ named. Two fixes, which are complementary:
    fall back to TCP, where the TLS server name is readable. It costs a
    little speed on first connection.
 
+**Fixed 20 Oct:** the forwarder now reads QUIC server names (RFC 9001 v1
+and RFC 9369 v2 Initial keys, header protection, AES-128-GCM, CRYPTO frames
+reassembled across datagrams and out of order). A new QUIC flow's first
+datagrams are held, 300 ms at most, until the name is read, so a block drops
+them before any reaches the server. Verified against RFC 9001's test
+vectors and against real Initials from Apple's QUIC stack, whose ClientHello
+spans two datagrams. Optional `--force-tcp-quic` drops QUIC whose name still
+cannot be read, so the browser falls back to TCP. Step 3 to be rerun.
+
 Step 4 (speed against tunnel-off) still to run.
 
 ## M2 — Packet tunnel on the iPhone

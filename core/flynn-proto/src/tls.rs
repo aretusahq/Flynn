@@ -60,6 +60,25 @@ pub fn client_hello_sni(data: &[u8]) -> Sni<'_> {
     Sni::Absent
 }
 
+/// The server name from a bare ClientHello handshake message (no record
+/// header), as carried in QUIC CRYPTO frames.
+pub fn handshake_sni(msg: &[u8]) -> Sni<'_> {
+    if msg.len() < 4 {
+        return Sni::Incomplete;
+    }
+    if msg[0] != 1 {
+        return Sni::NotTls;
+    }
+    let len = (usize::from(msg[1]) << 16) | (usize::from(msg[2]) << 8) | usize::from(msg[3]);
+    if len + 4 > MAX_CLIENT_HELLO {
+        return Sni::NotTls;
+    }
+    match msg.get(4..4 + len) {
+        Some(body) => parse_hello(body).unwrap_or(Sni::NotTls),
+        None => Sni::Incomplete,
+    }
+}
+
 fn parse_hello(body: &[u8]) -> Option<Sni<'_>> {
     let mut r = Reader { buf: body, at: 0 };
     r.skip(2 + 32)?; // legacy version, random

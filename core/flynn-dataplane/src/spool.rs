@@ -530,6 +530,7 @@ fn reason_code(r: CloseReason) -> u8 {
         CloseReason::Idle => 4,
         CloseReason::Capacity => 5,
         CloseReason::Shutdown => 6,
+        CloseReason::ForcedTcp => 7,
     }
 }
 fn reason_from(c: u8) -> Option<CloseReason> {
@@ -541,6 +542,7 @@ fn reason_from(c: u8) -> Option<CloseReason> {
         4 => CloseReason::Idle,
         5 => CloseReason::Capacity,
         6 => CloseReason::Shutdown,
+        7 => CloseReason::ForcedTcp,
         _ => return None,
     })
 }

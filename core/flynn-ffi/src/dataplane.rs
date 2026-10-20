@@ -48,6 +48,8 @@ pub struct ForwarderSettings {
     pub tcp_recv_buffer_kib: u32,
     pub tcp_send_buffer_kib: u32,
     pub sample_every_secs: u32,
+    /// Drop QUIC flows whose name cannot be read, so apps retry over TCP.
+    pub force_tcp_for_unnamed_quic: bool,
     /// Send DNS addressed to a virtual resolver to a real one instead.
     pub dns_redirect: Option<DnsRedirect>,
 }
@@ -69,6 +71,7 @@ pub fn default_forwarder_settings() -> ForwarderSettings {
         tcp_recv_buffer_kib: 16,
         tcp_send_buffer_kib: 32,
         sample_every_secs: 10,
+        force_tcp_for_unnamed_quic: false,
         dns_redirect: None,
     }
 }
@@ -86,6 +89,7 @@ impl ForwarderSettings {
         config.tcp_recv_buffer = (self.tcp_recv_buffer_kib.clamp(4, 1024) as usize) * 1024;
         config.tcp_send_buffer = (self.tcp_send_buffer_kib.clamp(4, 1024) as usize) * 1024;
         config.sample_every = Duration::from_secs(u64::from(self.sample_every_secs.max(1)));
+        config.force_tcp_for_unnamed_quic = self.force_tcp_for_unnamed_quic;
         if let Some(r) = &self.dns_redirect {
             let parse = |s: &str| {
                 s.parse::<SocketAddr>()

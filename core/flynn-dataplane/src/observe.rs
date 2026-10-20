@@ -44,6 +44,8 @@ struct Tracked {
     summary: FlowSummary,
     hello: Vec<u8>,
     sniffing: bool,
+    /// Reads the server name from a QUIC flow's Initial packets.
+    quic: Option<quic::InitialSniffer>,
 }
 
 impl FlowTracker {
@@ -150,6 +152,7 @@ impl FlowTracker {
                     },
                     hello: Vec::new(),
                     sniffing: flow_key.protocol == Transport::Tcp,
+                    quic: None,
                 },
             );
         }
@@ -173,7 +176,29 @@ impl FlowTracker {
                 && s.key.dst.port() == 443
                 && quic::initial_version(payload).is_some()
             {
+                if !s.quic {
+                    flow.quic = Some(quic::InitialSniffer::new());
+                }
                 s.quic = true;
+            }
+            if let Some(sniffer) = flow.quic.as_mut() {
+                match sniffer.feed(payload) {
+                    quic::QuicSni::Incomplete => {}
+                    quic::QuicSni::Found(name) => {
+                        if policy.decide(&FlowMeta {
+                            key: &s.key,
+                            name: Some(&name),
+                            app: None,
+                        }) == Verdict::Block
+                        {
+                            s.verdict = Verdict::Block;
+                        }
+                        s.name = Some(name);
+                        s.source = NameSource::Sni;
+                        flow.quic = None;
+                    }
+                    _ => flow.quic = None,
+                }
             }
             if flow.sniffing {
                 flow.hello.extend_from_slice(payload);

@@ -35,7 +35,11 @@ use crate::{FlowKey, Host, Transport};
 
 use device::TunDevice;
 use tcp::{PendingTcp, RelayCtx, TcpFlow};
-use udp::UdpFlow;
+use udp::{QuicCtx, QuicHold, UdpFlow};
+
+/// How long packets for a blocked UDP flow are dropped silently, so the
+/// app's retransmissions do not each open a new blocked flow.
+const UDP_TOMBSTONE: Duration = Duration::from_secs(30);
 
 const WAKER: Token = Token(0);
 
@@ -60,6 +64,12 @@ pub struct ForwarderConfig {
     pub sni_wait: Duration,
     /// How often to emit an `Event::Sample` with memory and counters.
     pub sample_every: Duration,
+    /// How long to hold a new QUIC flow's datagrams while reading its name.
+    pub quic_wait: Duration,
+    /// Drop QUIC flows that end up with no name (no DNS answer seen, no
+    /// readable server name), so apps retry over TCP, where the TLS server
+    /// name is visible and rules can match it.
+    pub force_tcp_for_unnamed_quic: bool,
 }
 
 impl ForwarderConfig {
@@ -78,6 +88,8 @@ impl ForwarderConfig {
             dns_cache_size: 4096,
             sni_wait: Duration::from_millis(500),
             sample_every: Duration::from_secs(10),
+            quic_wait: Duration::from_millis(300),
+            force_tcp_for_unnamed_quic: false,
         }
     }
 }
@@ -231,6 +243,7 @@ struct Forwarder {
     epoch: Instant,
     scratch: Vec<u8>,
     last_sample: Option<Instant>,
+    udp_tombstones: HashMap<FlowKey, Instant>,
 }
 
 impl Forwarder {
@@ -279,6 +292,7 @@ impl Forwarder {
             epoch,
             scratch: vec![0; 64 * 1024],
             last_sample: None,
+            udp_tombstones: HashMap::new(),
         }
     }
 
@@ -401,7 +415,8 @@ impl Forwarder {
     }
 
     /// Names, attributes and decides a new flow, emitting `FlowOpened`.
-    fn admit(&mut self, key: FlowKey) -> (FlowId, Verdict, Option<flynn_types::AppId>) {
+    /// Returns the flow's id, verdict, app, and whether DNS already named it.
+    fn admit(&mut self, key: FlowKey) -> (FlowId, Verdict, Option<flynn_types::AppId>, bool) {
         let id = self.next_id();
         let name = self.names.lookup(&key.dst.ip()).map(str::to_owned);
         let app = self.host.apps.resolve(&key);
@@ -411,6 +426,7 @@ impl Forwarder {
             app: app.as_ref(),
         });
         bump(&self.stats.flows_opened, 1);
+        let named = name.is_some();
         self.sink.emit(Event::FlowOpened {
             id,
             at_ms: self.now_ms(),
@@ -424,7 +440,7 @@ impl Forwarder {
             app: app.clone(),
             verdict,
         });
-        (id, verdict, app)
+        (id, verdict, app, named)
     }
 
     fn close_event(&self, id: FlowId, bytes_up: u64, bytes_down: u64, reason: CloseReason) {
@@ -438,7 +454,7 @@ impl Forwarder {
     }
 
     fn open_tcp(&mut self, key: FlowKey, syn: Vec<u8>) {
-        let (id, verdict, app) = self.admit(key);
+        let (id, verdict, app, _) = self.admit(key);
         if verdict == Verdict::Block {
             bump(&self.stats.flows_blocked, 1);
             self.close_event(id, 0, 0, CloseReason::Blocked);
@@ -569,17 +585,34 @@ impl Forwarder {
         }
     }
 
+    fn quic_ctx(&self) -> QuicCtx<'_> {
+        QuicCtx {
+            policy: &*self.config.policy,
+            sink: &*self.sink,
+            force_tcp_unnamed: self.config.force_tcp_for_unnamed_quic,
+            wait: self.config.quic_wait,
+        }
+    }
+
     fn ingest_udp(&mut self, key: FlowKey, payload: &[u8]) {
-        if let Some(flow) = self.udp.get_mut(&key) {
+        if let Some(mut flow) = self.udp.remove(&key) {
             let before = flow.bytes_up;
-            flow.send(payload);
+            flow.handle_app_datagram(payload, &self.quic_ctx());
             bump(&self.stats.bytes_up, flow.bytes_up - before);
+            self.udp.insert(key, flow);
             return;
         }
-        let (id, verdict, _app) = self.admit(key);
+        if let Some(since) = self.udp_tombstones.get(&key) {
+            if since.elapsed() < UDP_TOMBSTONE {
+                return; // a retransmission to a flow just blocked
+            }
+            self.udp_tombstones.remove(&key);
+        }
+        let (id, verdict, app, named) = self.admit(key);
         if verdict == Verdict::Block {
             bump(&self.stats.flows_blocked, 1);
             self.close_event(id, 0, 0, CloseReason::Blocked);
+            self.udp_tombstones.insert(key, Instant::now());
             return;
         }
         if self.udp.len() >= self.config.max_udp_flows {
@@ -606,18 +639,22 @@ impl Forwarder {
                 return;
             }
         };
+        let quic = key.dst.port() == 443 && flynn_proto::quic::initial_version(payload).is_some();
         let mut flow = UdpFlow {
             id,
             key,
             socket,
+            app,
             last_active: Instant::now(),
             is_dns: key.dst.port() == 53,
             answered: false,
+            named,
+            quic: quic.then(QuicHold::new),
             bytes_up: 0,
             bytes_down: 0,
             finished: None,
         };
-        flow.send(payload);
+        flow.handle_app_datagram(payload, &self.quic_ctx());
         bump(&self.stats.bytes_up, flow.bytes_up);
         self.udp.insert(key, flow);
         bump(&self.stats.udp_active, 1);
@@ -626,7 +663,14 @@ impl Forwarder {
     fn service_udp(&mut self) {
         let now_ms = self.now_ms();
         let (udp_idle, dns_idle) = (self.config.udp_idle, self.config.dns_idle);
+        let ctx = QuicCtx {
+            policy: &*self.config.policy,
+            sink: &*self.sink,
+            force_tcp_unnamed: self.config.force_tcp_for_unnamed_quic,
+            wait: self.config.quic_wait,
+        };
         for flow in self.udp.values_mut() {
+            flow.check_quic_timeout(&ctx);
             let before = flow.bytes_down;
             flow.receive(
                 &mut self.scratch,
@@ -656,12 +700,12 @@ impl Forwarder {
                 self.sockets.remove(flow.handle);
                 let _ = self.poll.registry().deregister(&mut { flow.stream });
                 self.stats.tcp_active.fetch_sub(1, Ordering::Relaxed);
-                self.close_event(
-                    flow.id,
-                    flow.bytes_up,
-                    flow.bytes_down,
-                    flow.finished.unwrap_or(CloseReason::Normal),
-                );
+                let reason = flow.finished.unwrap_or(CloseReason::Normal);
+                if reason == CloseReason::Blocked {
+                    // Blocked once its server name arrived.
+                    bump(&self.stats.flows_blocked, 1);
+                }
+                self.close_event(flow.id, flow.bytes_up, flow.bytes_down, reason);
             }
         }
         let done: Vec<FlowKey> = self
@@ -673,13 +717,19 @@ impl Forwarder {
         for key in done {
             if let Some(flow) = self.udp.remove(&key) {
                 self.stats.udp_active.fetch_sub(1, Ordering::Relaxed);
-                self.close_event(
-                    flow.id,
-                    flow.bytes_up,
-                    flow.bytes_down,
-                    flow.finished.unwrap_or(CloseReason::Normal),
-                );
+                let reason = flow.finished.unwrap_or(CloseReason::Normal);
+                if matches!(reason, CloseReason::Blocked | CloseReason::ForcedTcp) {
+                    if reason == CloseReason::Blocked {
+                        bump(&self.stats.flows_blocked, 1);
+                    }
+                    self.udp_tombstones.insert(key, Instant::now());
+                }
+                self.close_event(flow.id, flow.bytes_up, flow.bytes_down, reason);
             }
+        }
+        if self.udp_tombstones.len() > 256 {
+            self.udp_tombstones
+                .retain(|_, since| since.elapsed() < UDP_TOMBSTONE);
         }
     }
 

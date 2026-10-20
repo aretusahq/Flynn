@@ -107,6 +107,7 @@ pub enum CloseReason {
     ConnectFailed,
     Idle,
     Capacity,
+    ForcedTcp,
     Shutdown,
 }
 

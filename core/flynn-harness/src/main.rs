@@ -7,7 +7,7 @@
 //!
 //!   sudo flynn-harness live [--route CIDR]... [--all] [--block DOMAIN]...
 //!       [--interface en0] [--events] [--stats-every SECS]
-//!       [--recv-buffer KIB] [--send-buffer KIB]
+//!       [--recv-buffer KIB] [--send-buffer KIB] [--spool DIR] [--force-tcp-quic]
 //!       Open a utun interface, route traffic into it, and relay it through
 //!       the forwarder, printing throughput, flows and memory.
 //!
@@ -63,7 +63,7 @@ usage:
   flynn-harness replay <file.pcap> [--block DOMAIN]... [--expect FILE]
   sudo flynn-harness live [--route CIDR]... [--all] [--block DOMAIN]... [--interface IF]
                           [--events] [--stats-every SECS] [--recv-buffer KIB] [--send-buffer KIB]
-                          [--spool DIR]
+                          [--spool DIR] [--force-tcp-quic]
   flynn-harness spool-tail <dir> [COUNT]
   flynn-harness demo-spool <dir>
   flynn-harness gen-fixture <out.pcap>
@@ -341,6 +341,7 @@ fn cmd_live(args: &[String]) -> CmdResult {
         recv_buffer: num("--recv-buffer", 16)? as usize * 1024,
         send_buffer: num("--send-buffer", 32)? as usize * 1024,
         spool: a.one("--spool").map(std::path::PathBuf::from),
+        force_tcp_quic: a.has("--force-tcp-quic"),
     };
     live::run(opts).map_err(|e| e.to_string())?;
     Ok(ExitCode::SUCCESS)

@@ -29,6 +29,8 @@ pub struct LiveOptions {
     pub send_buffer: usize,
     /// Also write events to a spool in this directory.
     pub spool: Option<std::path::PathBuf>,
+    /// Drop QUIC flows with no readable name so apps fall back to TCP.
+    pub force_tcp_quic: bool,
 }
 
 /// Everything except 0.0.0.0/8. macOS resolves a socket pinned with
@@ -152,6 +154,10 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
     let mut config = ForwarderConfig::new(opts.policy);
     config.tcp_recv_buffer = opts.recv_buffer;
     config.tcp_send_buffer = opts.send_buffer;
+    config.force_tcp_for_unnamed_quic = opts.force_tcp_quic;
+    if opts.force_tcp_quic {
+        println!("QUIC without a readable name: dropped, so apps fall back to TCP");
+    }
     println!(
         "tcp buffers: recv {} KiB, send {} KiB per connection",
         opts.recv_buffer / 1024,
@@ -247,13 +253,14 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
         rate(peak_rate.1)
     );
     println!(
-        "flows: {} opened, {} blocked, {} connect failures; closed normal {} / reset {} / idle {}",
+        "flows: {} opened, {} blocked, {} connect failures; closed normal {} / reset {} / idle {} / forced to TCP {}",
         stats.flows_opened,
         stats.flows_blocked,
         stats.connect_failed,
         totals.normal,
         totals.reset,
-        totals.idle
+        totals.idle,
+        totals.forced_tcp
     );
     println!(
         "named: {} by DNS, {} by SNI, {} unnamed",
@@ -459,6 +466,7 @@ struct Totals {
     normal: u64,
     reset: u64,
     idle: u64,
+    forced_tcp: u64,
     /// Each flow counts once, by its final name source: a flow named by
     /// DNS at open and then by SNI counts as SNI.
     named_dns: u64,

@@ -204,6 +204,85 @@ pub fn client_hello(sni: Option<&str>, padding: usize) -> Vec<u8> {
     rec
 }
 
+/// Client Initial datagrams carrying `handshake` (a bare ClientHello
+/// message) in `packets` CRYPTO fragments, one packet per datagram, each
+/// padded to 1200 bytes. Fragments go out last-first, the way Chrome
+/// scrambles them, so readers must reassemble by offset.
+pub fn quic_initials(version: u32, dcid: &[u8], handshake: &[u8], packets: usize) -> Vec<Vec<u8>> {
+    use crate::quic::{self, VERSION_2};
+    use aes_gcm::aead::AeadInOut;
+    use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
+
+    let keys = quic::client_initial_keys(version, dcid).expect("supported version");
+    let packets = packets.max(1);
+    let chunk = handshake.len().div_ceil(packets);
+    let mut fragments: Vec<(usize, &[u8])> = handshake
+        .chunks(chunk)
+        .enumerate()
+        .map(|(i, c)| (i * chunk, c))
+        .collect();
+    fragments.reverse();
+
+    let initial_type: u8 = if version == VERSION_2 { 1 } else { 0 };
+    fragments
+        .iter()
+        .enumerate()
+        .map(|(pn, (offset, data))| {
+            let mut payload = vec![0x06];
+            push_varint(&mut payload, *offset as u64);
+            push_varint(&mut payload, data.len() as u64);
+            payload.extend_from_slice(data);
+
+            let pn_len = 2usize;
+            let mut header = vec![0xc0 | (initial_type << 4) | (pn_len as u8 - 1)];
+            header.extend_from_slice(&version.to_be_bytes());
+            header.push(dcid.len() as u8);
+            header.extend_from_slice(dcid);
+            header.push(0); // no source connection ID
+            header.push(0); // no token
+            // Pad the payload so the datagram reaches 1200 bytes.
+            let fixed = header.len() + 2 + pn_len + 16;
+            if fixed + payload.len() < 1200 {
+                payload.resize(1200 - fixed, 0);
+            }
+            let length = (pn_len + payload.len() + 16) as u64;
+            header.extend_from_slice(&(0x4000 | length as u16).to_be_bytes());
+            let pn_offset = header.len();
+            header.extend_from_slice(&(pn as u16).to_be_bytes());
+
+            let mut nonce = keys.iv;
+            for (i, b) in (pn as u64).to_be_bytes().iter().enumerate() {
+                nonce[4 + i] ^= b;
+            }
+            let cipher = Aes128Gcm::new(&keys.key.into());
+            let tag = cipher
+                .encrypt_inout_detached(&Nonce::from(nonce), &header, payload.as_mut_slice().into())
+                .expect("encrypt");
+            let mut packet = header;
+            packet.extend_from_slice(&payload);
+            packet.extend_from_slice(&tag);
+
+            let sample: [u8; 16] = packet[pn_offset + 4..pn_offset + 20]
+                .try_into()
+                .expect("sample");
+            let mask = quic::header_mask(&keys.hp, &sample);
+            packet[0] ^= mask[0] & 0x0f;
+            for i in 0..pn_len {
+                packet[pn_offset + i] ^= mask[1 + i];
+            }
+            packet
+        })
+        .collect()
+}
+
+fn push_varint(out: &mut Vec<u8>, v: u64) {
+    match v {
+        0..=63 => out.push(v as u8),
+        64..=16383 => out.extend_from_slice(&(0x4000 | v as u16).to_be_bytes()),
+        _ => out.extend_from_slice(&(0x8000_0000 | v as u32).to_be_bytes()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
