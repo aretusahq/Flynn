@@ -40,9 +40,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                     notifier: UserNotifier(),
                     capabilities: .tunnelOnly
                 )
-                try plane.start(settings: tunnelOptions.forwarderSettings())
+                let report = try plane.start(settings: tunnelOptions.forwarderSettings())
                 self.plane.withLock { $0 = plane }
-                self.logger.notice("forwarder started, core \(coreVersion(), privacy: .public)")
+                self.logger.notice("forwarder started, core \(coreVersion(), privacy: .public), \(report.rules.ruleCount) rules")
+                if let problem = report.rulesError {
+                    // The forwarder runs allow-all in that case, so say so.
+                    self.logger.error("rules file unusable: \(problem, privacy: .public)")
+                    UserNotifier().notify(
+                        title: "Flynn is allowing all traffic",
+                        body: "The rules file could not be read, so no rules apply. Open Flynn and save your rules again."
+                    )
+                }
                 self.readPackets()
                 done.value(nil)
             } catch {
@@ -74,8 +82,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                 running: running?.isRunning() ?? false,
                 stats: running?.stats(),
                 spoolErrors: running?.spoolErrors() ?? 0,
-                memory: processMemory()
+                memory: processMemory(),
+                rules: running?.rulesInfo()
             )
+            completionHandler?(try? JSONEncoder().encode(reply))
+        case .reloadRules:
+            let reply: RulesReloadReply
+            do {
+                guard let running else { throw NEVPNError(.configurationInvalid) }
+                reply = RulesReloadReply(info: try running.reloadRules())
+            } catch {
+                reply = RulesReloadReply(error: "\(error)")
+            }
             completionHandler?(try? JSONEncoder().encode(reply))
         case .testNotification:
             UserNotifier().notify(title: "Flynn", body: "This notification was posted by the tunnel extension.")

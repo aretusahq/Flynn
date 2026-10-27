@@ -3,6 +3,7 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,9 +12,11 @@ use std::time::{Duration, Instant};
 use flynn_dataplane::forwarder::{self, ForwarderConfig};
 use flynn_dataplane::{
     AppResolver, Clock, CloseReason, Event, EventSink, FlowKey, Host, HostError, Notifier,
-    PacketIo, Paths, Policy, SocketProtector, StatsSnapshot,
+    PacketIo, PacketPusher, Paths, RulesPolicy, SocketProtector, StatsSnapshot,
 };
 use flynn_rules::Verdict;
+
+use crate::rulesarg::{self, RulesArgs};
 use flynn_types::AppId;
 
 use crate::utun::Utun;
@@ -24,7 +27,7 @@ pub struct LiveOptions {
     pub interface: Option<String>,
     pub print_events: bool,
     pub stats_every: Duration,
-    pub policy: Arc<dyn Policy>,
+    pub rules: RulesArgs,
     pub recv_buffer: usize,
     pub send_buffer: usize,
     /// Also write events to a spool in this directory.
@@ -151,7 +154,9 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
         paths: Arc::new(TmpPaths),
         notifier: Arc::new(StdoutNotifier),
     };
-    let mut config = ForwarderConfig::new(opts.policy);
+    let policy = opts.rules.policy().map_err(io::Error::other)?;
+    println!("rules: {}", rulesarg::summary(&policy.rules()));
+    let mut config = ForwarderConfig::new(policy.clone());
     config.tcp_recv_buffer = opts.recv_buffer;
     config.tcp_send_buffer = opts.send_buffer;
     config.force_tcp_for_unnamed_quic = opts.force_tcp_quic;
@@ -174,12 +179,12 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
         printer: sink.clone(),
         spool: spool.clone(),
     });
-    let fwd = Arc::new(forwarder::spawn(host, config, tee)?);
+    let fwd = forwarder::spawn(host, config, tee)?;
 
     // Reader: tunnel -> forwarder. Blocks in read(2) until the process exits.
     {
         let utun = utun.clone();
-        let fwd = fwd.clone();
+        let pusher = fwd.pusher();
         std::thread::Builder::new()
             .name("utun-reader".into())
             .spawn(move || {
@@ -187,12 +192,29 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
                 loop {
                     match utun.read_packet(&mut buf) {
                         Ok(0) => continue,
-                        Ok(n) => fwd.push_packets([buf[..n].to_vec()]),
+                        Ok(n) => pusher.push_packets([buf[..n].to_vec()]),
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
                     }
                 }
             })?;
+    }
+
+    // Rules watcher: edit the --rules file and the new rules apply at once.
+    if let Some(file) = opts.rules.file.clone() {
+        let args = opts.rules.clone();
+        let policy = policy.clone();
+        let pusher = fwd.pusher();
+        std::thread::Builder::new()
+            .name("rules-watcher".into())
+            .spawn(move || watch_rules(&file, &args, &policy, &pusher))?;
+        println!(
+            "watching {} for changes",
+            opts.rules
+                .file
+                .as_deref()
+                .map_or(String::new(), |f| f.display().to_string())
+        );
     }
 
     println!("running; Ctrl-C to stop and print the summary\n");
@@ -228,11 +250,13 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
     }
 
     let stats = fwd.stats();
+    let drops = fwd.drop_breakdown();
+    let aborts = fwd.abort_causes();
     let mem = flynn_dataplane::mem::sample();
     let elapsed = start.elapsed().as_secs_f64();
-    if let Ok(fwd) = Arc::try_unwrap(fwd) {
-        fwd.stop();
-    }
+    // Resets what is still open and emits its close events, so the spool
+    // ends complete. Possible because the reader thread holds only a pusher.
+    fwd.stop();
     let totals = sink.totals.lock().map(|t| t.clone()).unwrap_or_default();
     println!("\n--- summary (paste into docs/spike-results.md) ---");
     println!("duration: {elapsed:.0} s");
@@ -267,9 +291,19 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
         totals.named_dns, totals.named_sni, totals.unnamed
     );
     println!(
-        "packets: {} in / {} out, {} dropped (not TCP/UDP or fragments)",
+        "packets: {} in / {} out, {} dropped (not TCP/UDP, fragments or malformed)",
         stats.packets_in, stats.packets_out, stats.dropped
     );
+    if !aborts.is_empty() {
+        let causes: Vec<String> = aborts
+            .iter()
+            .map(|(cause, n)| format!("{n} {cause}"))
+            .collect();
+        println!("unclean TCP closes: {}", causes.join("; "));
+    }
+    if stats.dropped > 0 {
+        println!("dropped by cause: {}", describe_drops(&drops));
+    }
     println!(
         "memory: footprint {} now, {} peak (whole harness process)",
         mib(mem.footprint),
@@ -282,6 +316,62 @@ pub fn run(opts: LiveOptions) -> io::Result<()> {
     );
     // Dropping the utun descriptor at exit removes the interface and routes.
     Ok(())
+}
+
+/// Re-reads the rules file whenever its modification time changes and swaps
+/// the new rules in. A file that does not parse is reported and the old
+/// rules stay.
+fn watch_rules(file: &Path, args: &RulesArgs, policy: &RulesPolicy, pusher: &PacketPusher) {
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut seen = modified(file);
+    let mut generation = 1;
+    loop {
+        std::thread::sleep(Duration::from_millis(400));
+        let now = modified(file);
+        if now == seen {
+            continue;
+        }
+        seen = now;
+        generation += 1;
+        match args.rule_set(generation) {
+            Ok(set) => {
+                println!("rules reloaded: {}", rulesarg::summary(&set));
+                policy.replace(set);
+                pusher.wake();
+            }
+            Err(e) => println!("rules NOT reloaded, keeping the old ones: {e}"),
+        }
+    }
+}
+
+/// "ICMP 52, IGMP 14, 3 fragments", most frequent protocol first.
+fn describe_drops(d: &flynn_dataplane::DropBreakdown) -> String {
+    let mut parts: Vec<String> = d
+        .protocols
+        .iter()
+        .map(|&(proto, n)| format!("{} {n}", protocol_name(proto)))
+        .collect();
+    if d.fragments > 0 {
+        parts.push(format!("{} later fragments", d.fragments));
+    }
+    if d.malformed > 0 {
+        parts.push(format!("{} malformed", d.malformed));
+    }
+    parts.join(", ")
+}
+
+fn protocol_name(proto: u8) -> String {
+    match proto {
+        1 => "ICMP".into(),
+        2 => "IGMP".into(),
+        41 => "IPv6-in-IPv4".into(),
+        47 => "GRE".into(),
+        50 => "ESP".into(),
+        51 => "AH".into(),
+        58 => "ICMPv6".into(),
+        132 => "SCTP".into(),
+        n => format!("protocol {n}"),
+    }
 }
 
 fn sh(cmd: &str, args: &[&str]) -> io::Result<()> {
@@ -533,6 +623,7 @@ impl EventSink for Printer {
                 key,
                 name,
                 verdict,
+                reason,
                 ..
             } => {
                 let v = if verdict == Verdict::Block {
@@ -541,12 +632,26 @@ impl EventSink for Printer {
                     "allow"
                 };
                 println!(
-                    "open  #{id} {:?} {} -> {} {} [{v}]",
+                    "open  #{id} {:?} {} -> {} {} [{v}: {}]",
                     key.protocol,
                     key.src,
                     key.dst,
-                    name.as_deref().unwrap_or("-")
+                    name.as_deref().unwrap_or("-"),
+                    crate::replay::why(reason)
                 );
+            }
+            Event::FlowDecided {
+                id,
+                verdict,
+                reason,
+                ..
+            } => {
+                let v = if verdict == Verdict::Block {
+                    "BLOCK"
+                } else {
+                    "allow"
+                };
+                println!("decide #{id} [{v}: {}]", crate::replay::why(reason));
             }
             Event::FlowNamed { id, name, .. } => println!("name  #{id} {name} (sni)"),
             Event::FlowClosed {
@@ -598,6 +703,19 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     /// Pinning needs no root, so it can be checked without the live run.
+    #[test]
+    fn drops_are_described_by_cause() {
+        let d = flynn_dataplane::DropBreakdown {
+            malformed: 2,
+            fragments: 1,
+            protocols: vec![(1, 52), (2, 14), (99, 3)],
+        };
+        assert_eq!(
+            describe_drops(&d),
+            "ICMP 52, IGMP 14, protocol 99 3, 1 later fragments, 2 malformed"
+        );
+    }
+
     #[test]
     fn all_routes_cover_ipv4_except_zero_slash_eight() {
         let mut covered: u64 = 0;

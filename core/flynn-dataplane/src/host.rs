@@ -58,11 +58,7 @@ pub struct FlowKey {
     pub dst: std::net::SocketAddr,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Transport {
-    Tcp,
-    Udp,
-}
+pub use flynn_types::Transport;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {

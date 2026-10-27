@@ -7,8 +7,9 @@ import SwiftUI
 /// screens in M6; kept afterwards as a hidden diagnostics page.
 struct DebugView: View {
     @State private var controller = TunnelController()
-    @State private var blockedText = ""
     @State private var showSamples = false
+    @State private var selfTest: [SelfTestResult] = []
+    @State private var selfTestRunning = false
 
     var body: some View {
         NavigationStack {
@@ -16,13 +17,14 @@ struct DebugView: View {
                 tunnelSection
                 if let stats = controller.stats { countersSection(stats) }
                 memorySection
-                switchesSection
-                eventsSection
+                if TunnelController.tunnelAvailable { rulesSection; switchesSection }
+                selfTestSection
+                if TunnelController.tunnelAvailable { eventsSection }
                 aboutSection
             }
             .navigationTitle("Flynn")
             .task {
-                blockedText = controller.options.blockedDomains.joined(separator: ", ")
+                await runSelfTest()
                 await controller.load()
                 while !Task.isCancelled {
                     await controller.refresh()
@@ -34,7 +36,19 @@ struct DebugView: View {
 
     // MARK: Sections
 
-    private var tunnelSection: some View {
+    @ViewBuilder private var tunnelSection: some View {
+        if TunnelController.tunnelAvailable { liveTunnelSection } else { noTunnelSection }
+    }
+
+    private var noTunnelSection: some View {
+        Section {
+            LabeledContent("Tunnel", value: "Not in this build")
+        } footer: {
+            Text("This is the free-team test build. A free Apple developer team cannot use Network Extensions, so this build has no tunnel and captures nothing. It does run the same Rust core inside the app: see the self-test below. The capture build needs a paid Apple Developer Program team.")
+        }
+    }
+
+    private var liveTunnelSection: some View {
         Section {
             LabeledContent("Tunnel", value: controller.status.label)
             if controller.isActive {
@@ -62,6 +76,7 @@ struct DebugView: View {
             LabeledContent("Blocked / connect failed", value: "\(s.flowsBlocked) / \(s.connectFailed)")
             LabeledContent("Packets in / out", value: "\(s.packetsIn) / \(s.packetsOut)")
             LabeledContent("Dropped packets", value: "\(s.dropped)")
+            LabeledContent("Rules in force", value: "\(s.ruleCount)\(s.rulesPanic ? " · panic on" : "")")
             if s.spoolErrors > 0 {
                 LabeledContent("Spool write errors", value: "\(s.spoolErrors)")
                     .foregroundStyle(.red)
@@ -69,7 +84,52 @@ struct DebugView: View {
         }
     }
 
-    private var memorySection: some View {
+    @ViewBuilder private var memorySection: some View {
+        if TunnelController.tunnelAvailable {
+            liveMemorySection
+        } else {
+            Section("Memory") {
+                LabeledContent("App footprint", value: mib(controller.appMemory.footprint))
+            }
+        }
+    }
+
+    private var selfTestSection: some View {
+        Section {
+            if selfTest.isEmpty {
+                Text(selfTestRunning ? "Running…" : "Not run yet.")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(selfTest) { result in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: result.passed ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                            .foregroundStyle(result.passed ? .green : .red)
+                        Text(result.name).font(.subheadline)
+                    }
+                    Text(result.detail)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Button("Run again") { Task { await runSelfTest() } }
+                .disabled(selfTestRunning)
+        } header: {
+            Text("Core self-test")
+        } footer: {
+            Text("Runs the Rust core inside this app, on this device: the QUIC crypto, the parsers, file writes, the memory sampler and a UDP flow through the forwarder. The result is also saved as selftest.txt in the app's Documents folder.")
+        }
+    }
+
+    private func runSelfTest() async {
+        selfTestRunning = true
+        let results = await Task.detached { CoreSelfTest.run() }.value
+        selfTest = results
+        CoreSelfTest.saveReport(results)
+        selfTestRunning = false
+    }
+
+    private var liveMemorySection: some View {
         Section {
             if let sample = controller.latestSample {
                 LabeledContent("Extension footprint", value: mib(sample.mem.footprint))
@@ -88,17 +148,40 @@ struct DebugView: View {
         }
     }
 
-    private var switchesSection: some View {
+    private var rulesSection: some View {
         Section {
             Picker("Mode", selection: $controller.options.mode) {
                 Text("Allow all").tag(TunnelOptions.Mode.allowAll)
                 Text("Block all").tag(TunnelOptions.Mode.blockAll)
                 Text("Lockdown").tag(TunnelOptions.Mode.lockdown)
             }
-            TextField("Blocked domains, comma-separated", text: $blockedText)
+            .onChange(of: controller.options.mode) { Task { await controller.applyRules() } }
+            Toggle("Essentials in block-all", isOn: $controller.options.essentials)
+                .onChange(of: controller.options.essentials) { Task { await controller.applyRules() } }
+            Toggle("Panic: allow everything", isOn: Binding(
+                get: { controller.options.panic },
+                set: { on in Task { await controller.setPanic(on) } }
+            ))
+            TextEditor(text: $controller.options.rulesText)
+                .font(.footnote.monospaced())
+                .frame(minHeight: 140)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
-                .onSubmit(saveBlocked)
+            Button("Save and apply rules") { Task { await controller.applyRules() } }
+            if let error = controller.rulesError {
+                Text(error).font(.footnote).foregroundStyle(.red)
+            } else if let status = controller.rulesStatus {
+                Text(status).font(.footnote).foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Rules")
+        } footer: {
+            Text("One rule per line, for example: block subdomains tracker.test, allow domain www.example.com tcp port 443, block cidr 10.0.0.0/8. The most specific rule wins; block beats allow on a tie. Applies to the running tunnel at once.")
+        }
+    }
+
+    private var switchesSection: some View {
+        Section {
             Stepper("Receive buffer \(controller.options.recvBufferKiB) KiB",
                     value: $controller.options.recvBufferKiB, in: 4...256, step: 4)
             Stepper("Send buffer \(controller.options.sendBufferKiB) KiB",
@@ -114,7 +197,6 @@ struct DebugView: View {
                     .autocorrectionDisabled()
             }
             Button("Save to VPN configuration") {
-                saveBlocked()
                 Task { await controller.apply() }
             }
             Button("Send test notification from the extension") {
@@ -123,7 +205,7 @@ struct DebugView: View {
         } header: {
             Text("Spike switches")
         } footer: {
-            Text("Changes take effect the next time the tunnel starts. Lockdown and block-all have no essentials list yet, so they cut almost everything.")
+            Text("Changes take effect the next time the tunnel starts.")
         }
     }
 
@@ -167,13 +249,6 @@ struct DebugView: View {
             .filter { $0.pathExtension == "bin" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
-
-    private func saveBlocked() {
-        controller.options.blockedDomains = blockedText
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
-            .filter { !$0.isEmpty }
-    }
 }
 
 private struct EventRow: View {
@@ -188,8 +263,10 @@ private struct EventRow: View {
 
     private var title: String {
         switch event {
-        case let .flowOpened(_, _, transport, _, _, name, _, _, verdict):
+        case let .flowOpened(_, _, transport, _, _, name, _, _, verdict, _):
             "\(verdict == .block ? "Blocked" : "Opened") \(transport == .tcp ? "TCP" : "UDP") \(name ?? "unknown destination")"
+        case let .flowDecided(_, _, verdict, _):
+            verdict == .block ? "Now blocked" : "Now allowed"
         case let .flowNamed(_, name, _):
             "Named \(name)"
         case let .flowClosed(id, _, _, _, reason):
@@ -203,8 +280,10 @@ private struct EventRow: View {
 
     private var detail: String {
         switch event {
-        case let .flowOpened(id, atMs, _, src, dst, _, source, _, _):
-            "#\(id) \(src) → \(dst) · name from \(source.label) · \(time(atMs))"
+        case let .flowOpened(id, atMs, _, src, dst, _, source, _, _, reason):
+            "#\(id) \(src) → \(dst) · name from \(source.label) · \(reason.label) · \(time(atMs))"
+        case let .flowDecided(id, atMs, _, reason):
+            "#\(id) · \(reason.label) · \(time(atMs))"
         case let .flowNamed(id, _, source):
             "#\(id) · from \(source.label)"
         case let .flowClosed(_, atMs, up, down, _):
@@ -234,6 +313,19 @@ private extension CloseReason {
         case .capacity: "flow table full"
         case .forcedTcp: "QUIC unnamed, app sent to TCP"
         case .shutdown: "tunnel stopped"
+        }
+    }
+}
+
+private extension Reason {
+    var label: String {
+        switch self {
+        case .panic: "panic switch"
+        case .lockdown: "lockdown"
+        case let .rule(id): "rule \(id)"
+        case .essential: "essential"
+        case .modeDefault: "mode default"
+        case .awaitingName: "waiting for name"
         }
     }
 }

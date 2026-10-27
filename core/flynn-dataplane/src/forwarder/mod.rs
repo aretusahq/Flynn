@@ -20,7 +20,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use flynn_proto::{ip, transport};
-use flynn_rules::Verdict;
+use flynn_rules::{Decision, NameState};
 use mio::{Events, Interest, Poll, Token, Waker};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
@@ -30,11 +30,11 @@ use smoltcp::wire::{
 
 use crate::events::{CloseReason, Event, EventSink, FlowId};
 use crate::names::{DnsCache, NameSource};
-use crate::policy::{FlowMeta, Policy};
+use crate::policy::{FlowMeta, Policy, Standing};
 use crate::{FlowKey, Host, Transport};
 
 use device::TunDevice;
-use tcp::{PendingTcp, RelayCtx, TcpFlow};
+use tcp::{AbortLog, PendingTcp, RelayCtx, TcpFlow};
 use udp::{QuicCtx, QuicHold, UdpFlow};
 
 /// How long packets for a blocked UDP flow are dropped silently, so the
@@ -95,8 +95,49 @@ impl ForwarderConfig {
 }
 
 /// Counters readable from any thread while the forwarder runs.
+/// Why a packet was not relayed. Counted by cause, so a rising drop count
+/// can be explained and not only observed.
+#[derive(Clone, Copy)]
+enum DropReason {
+    Malformed,
+    Fragment,
+    /// Not TCP or UDP: the IP protocol number.
+    Protocol(u8),
+}
+
+struct DropCounters {
+    malformed: AtomicU64,
+    fragments: AtomicU64,
+    /// Indexed by IP protocol number.
+    protocols: [AtomicU64; 256],
+}
+
+impl Default for DropCounters {
+    fn default() -> Self {
+        Self {
+            malformed: AtomicU64::new(0),
+            fragments: AtomicU64::new(0),
+            protocols: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+/// Packets the forwarder did not relay, by cause.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DropBreakdown {
+    /// Headers that failed to parse.
+    pub malformed: u64,
+    /// IP fragments after the first, which carry no transport header.
+    pub fragments: u64,
+    /// IP protocol number and count for packets that were neither TCP nor
+    /// UDP, most frequent first (1 is ICMP, 2 IGMP, 58 ICMPv6).
+    pub protocols: Vec<(u8, u64)>,
+}
+
 #[derive(Default)]
 struct Stats {
+    drops: DropCounters,
+    aborts: AbortLog,
     packets_in: AtomicU64,
     packets_out: AtomicU64,
     bytes_up: AtomicU64,
@@ -157,18 +198,80 @@ pub struct ForwarderHandle {
     thread: Option<JoinHandle<()>>,
 }
 
+/// Feeds packets to a running forwarder from another thread. Unlike the
+/// handle it does not own the forwarder, so a reader thread blocked in a
+/// read cannot keep the forwarder from shutting down.
+#[derive(Clone)]
+pub struct PacketPusher {
+    inbox: Arc<Mutex<Vec<Vec<u8>>>>,
+    waker: Arc<Waker>,
+}
+
+impl PacketPusher {
+    pub fn push_packets(&self, packets: impl IntoIterator<Item = Vec<u8>>) {
+        push(&self.inbox, &self.waker, packets);
+    }
+
+    /// Wakes the forwarder, for instance after replacing its rules.
+    pub fn wake(&self) {
+        let _ = self.waker.wake();
+    }
+}
+
+fn push(inbox: &Mutex<Vec<Vec<u8>>>, waker: &Waker, packets: impl IntoIterator<Item = Vec<u8>>) {
+    {
+        let mut inbox = inbox.lock().unwrap_or_else(|e| e.into_inner());
+        inbox.extend(packets);
+    }
+    let _ = waker.wake();
+}
+
 impl ForwarderHandle {
     /// Hands packets read from the tunnel to the forwarder.
     pub fn push_packets(&self, packets: impl IntoIterator<Item = Vec<u8>>) {
-        {
-            let mut inbox = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
-            inbox.extend(packets);
-        }
+        push(&self.inbox, &self.waker, packets);
+    }
+
+    /// Wakes the forwarder so it notices a change now instead of on its next
+    /// pass (at most a second away). Call it after replacing the rules.
+    pub fn wake(&self) {
         let _ = self.waker.wake();
+    }
+
+    /// A cloneable feeder for a reader thread.
+    pub fn pusher(&self) -> PacketPusher {
+        PacketPusher {
+            inbox: self.inbox.clone(),
+            waker: self.waker.clone(),
+        }
+    }
+
+    /// Why TCP flows ended other than by a clean close (count per cause,
+    /// most frequent first), such as "app reset an open connection".
+    pub fn abort_causes(&self) -> Vec<(String, u64)> {
+        self.stats.aborts.snapshot()
     }
 
     pub fn stats(&self) -> StatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// The `dropped` count in [`StatsSnapshot`], split by cause.
+    pub fn drop_breakdown(&self) -> DropBreakdown {
+        let d = &self.stats.drops;
+        let mut protocols: Vec<(u8, u64)> = d
+            .protocols
+            .iter()
+            .enumerate()
+            .map(|(proto, n)| (proto as u8, n.load(Ordering::Relaxed)))
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        protocols.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        DropBreakdown {
+            malformed: d.malformed.load(Ordering::Relaxed),
+            fragments: d.fragments.load(Ordering::Relaxed),
+            protocols,
+        }
     }
 
     /// Resets every open connection and waits for the thread to exit.
@@ -223,6 +326,16 @@ pub fn spawn(
     })
 }
 
+/// What admitting a flow produced.
+struct Admission {
+    id: FlowId,
+    decision: Decision,
+    standing: Standing,
+    app: Option<flynn_types::AppId>,
+    /// The name DNS gave the destination, if any.
+    dns_name: Option<String>,
+}
+
 struct Forwarder {
     host: Host,
     config: ForwarderConfig,
@@ -244,6 +357,8 @@ struct Forwarder {
     scratch: Vec<u8>,
     last_sample: Option<Instant>,
     udp_tombstones: HashMap<FlowKey, Instant>,
+    /// The policy generation the open flows were last checked against.
+    policy_generation: u64,
 }
 
 impl Forwarder {
@@ -273,6 +388,7 @@ impl Forwarder {
         let _ = iface.routes_mut().add_default_ipv6_route(v6);
         iface.set_any_ip(true);
 
+        let policy_generation = config.policy.generation();
         Self {
             names: DnsCache::new(config.dns_cache_size),
             host,
@@ -293,6 +409,7 @@ impl Forwarder {
             scratch: vec![0; 64 * 1024],
             last_sample: None,
             udp_tombstones: HashMap::new(),
+            policy_generation,
         }
     }
 
@@ -325,6 +442,75 @@ impl Forwarder {
         self.shutdown();
     }
 
+    /// When the rules were replaced, looks at every open flow again with its
+    /// current name: a flow the new rules block is reset at once. This is
+    /// what makes lockdown and the panic switch take hold on connections
+    /// that are already up, not only on new ones.
+    fn reevaluate_if_rules_changed(&mut self) {
+        let generation = self.config.policy.generation();
+        if generation == self.policy_generation {
+            return;
+        }
+        self.policy_generation = generation;
+        let now_ms = self.now_ms();
+        let policy = self.config.policy.clone();
+        let sink = self.sink.clone();
+
+        // Flows still connecting to their server.
+        let mut blocked_pending = Vec::new();
+        for (key, p) in self.pending.iter_mut() {
+            let name = match &p.name {
+                Some(n) => NameState::Known(n),
+                None if p.standing.awaiting_name => NameState::Pending,
+                None => NameState::Unavailable,
+            };
+            let decision = policy.decide(&FlowMeta {
+                key,
+                name,
+                app: p.app.as_ref(),
+            });
+            if let Some((verdict, reason)) = p.standing.update(decision) {
+                sink.emit(Event::FlowDecided {
+                    id: p.id,
+                    at_ms: now_ms,
+                    verdict,
+                    reason,
+                });
+            }
+            if matches!(decision, Decision::Block(_)) {
+                blocked_pending.push(*key);
+            }
+        }
+        for key in blocked_pending {
+            if let Some(mut p) = self.pending.remove(&key) {
+                let _ = self.poll.registry().deregister(&mut p.stream);
+                bump(&self.stats.flows_blocked, 1);
+                self.close_event(p.id, 0, 0, CloseReason::Blocked);
+                // With no socket for it, the app gets a reset.
+                self.device.rx.push_back(p.syn);
+            }
+        }
+
+        for flow in self.tcp.values_mut() {
+            if flow.finished.is_some() {
+                continue;
+            }
+            if matches!(flow.recheck(&*policy, &*sink, now_ms), Decision::Block(_)) {
+                self.sockets.get_mut::<TcpSocket>(flow.handle).abort();
+                flow.finished = Some(CloseReason::Blocked);
+            }
+        }
+        for flow in self.udp.values_mut() {
+            if flow.finished.is_some() {
+                continue;
+            }
+            if matches!(flow.recheck(&*policy, &*sink, now_ms), Decision::Block(_)) {
+                flow.quic = None;
+                flow.finished = Some(CloseReason::Blocked);
+            }
+        }
+    }
+
     /// One pass: take packets in, run the stack, move bytes, send packets out.
     fn step(&mut self) {
         let packets = std::mem::take(&mut *self.inbox.lock().unwrap_or_else(|e| e.into_inner()));
@@ -332,6 +518,7 @@ impl Forwarder {
         for packet in packets {
             self.ingest(packet);
         }
+        self.reevaluate_if_rules_changed();
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.service_pending();
@@ -366,19 +553,29 @@ impl Forwarder {
         id
     }
 
+    fn drop_packet(&self, reason: DropReason) {
+        bump(&self.stats.dropped, 1);
+        let d = &self.stats.drops;
+        match reason {
+            DropReason::Malformed => bump(&d.malformed, 1),
+            DropReason::Fragment => bump(&d.fragments, 1),
+            DropReason::Protocol(proto) => bump(&d.protocols[usize::from(proto)], 1),
+        }
+    }
+
     fn ingest(&mut self, packet: Vec<u8>) {
         let Ok(p) = ip::parse(&packet) else {
-            bump(&self.stats.dropped, 1);
+            self.drop_packet(DropReason::Malformed);
             return;
         };
         if p.later_fragment {
-            bump(&self.stats.dropped, 1);
+            self.drop_packet(DropReason::Fragment);
             return;
         }
         match p.protocol {
             ip::PROTO_TCP => {
                 let Ok(t) = transport::parse_tcp(p.payload) else {
-                    bump(&self.stats.dropped, 1);
+                    self.drop_packet(DropReason::Malformed);
                     return;
                 };
                 let key = FlowKey {
@@ -400,7 +597,7 @@ impl Forwarder {
             }
             ip::PROTO_UDP => {
                 let Ok(u) = transport::parse_udp(p.payload) else {
-                    bump(&self.stats.dropped, 1);
+                    self.drop_packet(DropReason::Malformed);
                     return;
                 };
                 let key = FlowKey {
@@ -410,37 +607,52 @@ impl Forwarder {
                 };
                 self.ingest_udp(key, u.payload);
             }
-            _ => bump(&self.stats.dropped, 1),
+            other => self.drop_packet(DropReason::Protocol(other)),
         }
     }
 
     /// Names, attributes and decides a new flow, emitting `FlowOpened`.
-    /// Returns the flow's id, verdict, app, and whether DNS already named it.
-    fn admit(&mut self, key: FlowKey) -> (FlowId, Verdict, Option<flynn_types::AppId>, bool) {
+    /// `can_name` says whether a server name may still arrive for it (a TLS
+    /// ClientHello over TCP, or a QUIC Initial).
+    fn admit(&mut self, key: FlowKey, can_name: bool) -> Admission {
         let id = self.next_id();
-        let name = self.names.lookup(&key.dst.ip()).map(str::to_owned);
+        let dns_name = self.names.lookup(&key.dst.ip()).map(str::to_owned);
         let app = self.host.apps.resolve(&key);
-        let verdict = self.config.policy.decide(&FlowMeta {
-            key: &key,
-            name: name.as_deref(),
-            app: app.as_ref(),
-        });
+        let decision = {
+            let name = match &dns_name {
+                Some(n) => NameState::Known(n),
+                None if can_name => NameState::Pending,
+                None => NameState::Unavailable,
+            };
+            self.config.policy.decide(&FlowMeta {
+                key: &key,
+                name,
+                app: app.as_ref(),
+            })
+        };
+        let standing = Standing::from_decision(decision);
         bump(&self.stats.flows_opened, 1);
-        let named = name.is_some();
         self.sink.emit(Event::FlowOpened {
             id,
             at_ms: self.now_ms(),
             key,
-            source: if name.is_some() {
+            source: if dns_name.is_some() {
                 NameSource::Dns
             } else {
                 NameSource::None
             },
-            name,
+            name: dns_name.clone(),
             app: app.clone(),
-            verdict,
+            verdict: standing.verdict,
+            reason: standing.reason,
         });
-        (id, verdict, app, named)
+        Admission {
+            id,
+            decision,
+            standing,
+            app,
+            dns_name,
+        }
     }
 
     fn close_event(&self, id: FlowId, bytes_up: u64, bytes_down: u64, reason: CloseReason) {
@@ -454,8 +666,9 @@ impl Forwarder {
     }
 
     fn open_tcp(&mut self, key: FlowKey, syn: Vec<u8>) {
-        let (id, verdict, app, _) = self.admit(key);
-        if verdict == Verdict::Block {
+        let adm = self.admit(key, true);
+        let id = adm.id;
+        if matches!(adm.decision, Decision::Block(_)) {
             bump(&self.stats.flows_blocked, 1);
             self.close_event(id, 0, 0, CloseReason::Blocked);
             self.device.rx.push_back(syn);
@@ -489,7 +702,9 @@ impl Forwarder {
                         syn,
                         stream,
                         started: Instant::now(),
-                        app,
+                        app: adm.app,
+                        name: adm.dns_name,
+                        standing: adm.standing,
                     },
                 );
             }
@@ -554,7 +769,11 @@ impl Forwarder {
                     stream: p.stream,
                     app: p.app,
                     created: Instant::now(),
+                    listen_passes: 0,
                     established: false,
+                    established_at: None,
+                    name: p.name,
+                    standing: p.standing,
                     sniffing: true,
                     first_data: None,
                     remote_eof: false,
@@ -569,12 +788,15 @@ impl Forwarder {
     }
 
     fn service_tcp(&mut self) {
+        let now_ms = self.now_ms();
         let mut ctx = RelayCtx {
             policy: &*self.config.policy,
             sink: &*self.sink,
             scratch: &mut self.scratch,
             sni_wait: self.config.sni_wait,
             listen_timeout: self.config.connect_timeout,
+            aborts: &self.stats.aborts,
+            now_ms,
         };
         for flow in self.tcp.values_mut() {
             let socket = self.sockets.get_mut::<TcpSocket>(flow.handle);
@@ -591,6 +813,7 @@ impl Forwarder {
             sink: &*self.sink,
             force_tcp_unnamed: self.config.force_tcp_for_unnamed_quic,
             wait: self.config.quic_wait,
+            now_ms: self.now_ms(),
         }
     }
 
@@ -608,8 +831,12 @@ impl Forwarder {
             }
             self.udp_tombstones.remove(&key);
         }
-        let (id, verdict, app, named) = self.admit(key);
-        if verdict == Verdict::Block {
+        // A QUIC flow may still be named from its Initial packets; any other
+        // UDP flow has no name to wait for.
+        let quic = key.dst.port() == 443 && flynn_proto::quic::initial_version(payload).is_some();
+        let adm = self.admit(key, quic);
+        let id = adm.id;
+        if matches!(adm.decision, Decision::Block(_)) {
             bump(&self.stats.flows_blocked, 1);
             self.close_event(id, 0, 0, CloseReason::Blocked);
             self.udp_tombstones.insert(key, Instant::now());
@@ -639,16 +866,16 @@ impl Forwarder {
                 return;
             }
         };
-        let quic = key.dst.port() == 443 && flynn_proto::quic::initial_version(payload).is_some();
         let mut flow = UdpFlow {
             id,
             key,
             socket,
-            app,
+            app: adm.app,
             last_active: Instant::now(),
             is_dns: key.dst.port() == 53,
             answered: false,
-            named,
+            name: adm.dns_name,
+            standing: adm.standing,
             quic: quic.then(QuicHold::new),
             bytes_up: 0,
             bytes_down: 0,
@@ -668,6 +895,7 @@ impl Forwarder {
             sink: &*self.sink,
             force_tcp_unnamed: self.config.force_tcp_for_unnamed_quic,
             wait: self.config.quic_wait,
+            now_ms,
         };
         for flow in self.udp.values_mut() {
             flow.check_quic_timeout(&ctx);

@@ -3,7 +3,7 @@
 
 use std::net::IpAddr;
 
-use flynn_rules::Verdict;
+use flynn_rules::{Reason, Verdict};
 use flynn_types::AppId;
 
 use crate::mem::MemSample;
@@ -20,7 +20,19 @@ pub enum Event {
         name: Option<String>,
         source: NameSource,
         app: Option<AppId>,
+        /// What the flow got when it opened. A flow whose server name is
+        /// still awaited is provisionally allowed with
+        /// `Reason::AwaitingName`; a later `FlowDecided` settles it.
         verdict: Verdict,
+        reason: Reason,
+    },
+    /// The verdict changed after the flow opened: its server name arrived
+    /// (or none will), or the rules were replaced.
+    FlowDecided {
+        id: FlowId,
+        at_ms: i64,
+        verdict: Verdict,
+        reason: Reason,
     },
     /// A better name arrived after the flow opened (the TLS server name).
     FlowNamed {

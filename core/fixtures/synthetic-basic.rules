@@ -1,0 +1,3 @@
+# What `--block tracker.test` means: the name and everything under it.
+block domain tracker.test
+block subdomains tracker.test

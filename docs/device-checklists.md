@@ -6,14 +6,45 @@ long soaks. Claude adds a section per milestone; record results in
 
 ## M0 — Foundations
 
-- [ ] Apple Developer Program membership active (individual is fine for personal use).
-- [ ] Copy `apple/Config/Signing.local.xcconfig.example` to `Signing.local.xcconfig` and set `DEVELOPMENT_TEAM`.
-- [ ] In Xcode, with automatic signing, let it register the four bundle IDs:
-      `io.aretusa.flynn`, `.tunnel`, `.filter-data`, `.filter-control`,
-      the App Group `group.io.aretusa.flynn`, and the Network Extension
-      capability (packet tunnel and content filter).
-- [ ] Build and run the Flynn scheme on the iPhone. The home screen shows the core version and a shared-container path (not "App Group unavailable").
+- [ ] Apple Developer Program membership active (paid; an individual account is fine for personal use). Network Extensions need it.
+- [ ] Xcode signed in to that account: Xcode > Settings > Accounts. (Until then
+      this Mac has no signing identities and nothing can be signed.)
+- [ ] Find your 10-character Team ID: developer.apple.com > Account > Membership
+      details, or Xcode > Settings > Accounts > the team.
+- [ ] Copy `apple/Config/Signing.local.xcconfig.example` to `Signing.local.xcconfig`
+      (same folder) and set `DEVELOPMENT_TEAM` to the Team ID. The file is git-ignored.
+- [ ] iPhone: plug it in, unlock it and tap **Trust**. Turn on **Developer Mode**
+      (Settings > Privacy & Security > Developer Mode; it restarts the phone).
+      `xcrun devicectl list devices` should then show it as `connected`
+      rather than `unavailable`.
+- [ ] Install: `scripts/device-install.sh "<device name>"`. It builds, signs with
+      automatic provisioning (Xcode registers the four bundle IDs
+      `io.aretusa.flynn`, `.tunnel`, `.filter-data`, `.filter-control`, the App
+      Group `group.io.aretusa.flynn` and the Network Extension capability),
+      installs and launches. If iOS says the developer is not trusted, open
+      Settings > General > VPN & Device Management and trust it.
+- [ ] The home screen shows the core version and a shared-container path (not
+      "App Group unavailable"). If provisioning is refused, send me the error.
 - [ ] Same on the iPad.
+
+## Free-team test build (no paid Apple membership needed)
+
+A free Apple team cannot use Network Extensions, so the full app cannot be
+signed with it. The `FlynnFree` target is the same app without the tunnel:
+the same Rust core and screens, no extensions, bundle ID
+`io.aretusa.flynn.freetest`. It shows an on-device self-test of the core
+(QUIC crypto, parsers, file writes, memory sampler, a UDP flow through the
+forwarder) and captures nothing.
+
+- [ ] `scripts/device-install.sh "<device name>" free` builds, signs, installs
+      and launches it, then reads the self-test report back.
+- [ ] The first launch is refused until you trust the developer on the phone:
+      Settings > General > VPN & Device Management > your Apple ID > Trust.
+      Then run the same command again, or open the app.
+- [ ] Free provisioning limits: the app stops launching after seven days (run
+      the command again to reinstall) and a device holds up to three such apps.
+- [ ] The report is `build/device-selftest.txt`; the app also shows it on screen.
+      Every line should say PASS.
 
 ## M1 — Forwarder on the Mac (needs sudo)
 
@@ -48,9 +79,8 @@ records (not just several TCP segments) is logged without a name.
 
 ## M2 — Packet tunnel on the iPhone
 
-Needs the M0 signing steps done (Team ID in `apple/Config/Signing.local.xcconfig`).
-Run `scripts/bootstrap.sh`, open `apple/Flynn.xcodeproj`, pick the iPhone and
-run the Flynn scheme. The app opens on the debug screen.
+Needs the M0 signing steps done and the app installed with
+`scripts/device-install.sh "<device name>"`. The app opens on the debug screen.
 
 **First start**
 - [ ] Tap **Start** and allow the VPN configuration. Status reaches **On**.
@@ -62,9 +92,15 @@ run the Flynn scheme. The app opens on the debug screen.
       stop, start, and check again.
 
 **Blocking**
-- [ ] Add `example.com` to blocked domains, **Save to VPN configuration**,
-      stop and start the tunnel, open https://example.com. It should fail,
-      with a "Closed … (blocked)" event.
+- [ ] In **Rules**, type `block subdomains example.com` and `block domain
+      example.com`, tap **Save and apply rules** with the tunnel running, and
+      open https://example.com. It should fail at once, no restart, with a
+      "Blocked … (rule 1 or 2)" event.
+- [ ] Remove the lines, apply again, and check it loads.
+- [ ] Set mode **Block all**, then try Safari and a push (send yourself an
+      iMessage). Note what still works (essentials) and what breaks.
+- [ ] Set mode **Lockdown**: an open page should stop loading. Flip **Panic**:
+      traffic returns immediately.
 
 **Notifications from the extension**
 - [ ] Tap **Send test notification from the extension** (allow
@@ -84,8 +120,10 @@ run the Flynn scheme. The app opens on the debug screen.
       relays for other apps).
 - [ ] A speed test with the tunnel off, then on (default buffers), then on
       with 64/128 KiB buffers. Record down/up for each.
-- [ ] **Export spool** (bottom of the screen), AirDrop it to the Mac, and run
-      `core/target/release/flynn-harness spool-tail <folder> 500` on the files' folder, or
-      send the folder to Claude.
+- [ ] Pull the spool straight off the phone, with no AirDrop:
+      `scripts/device-pull-spool.sh "<device name>" 500` copies it into
+      `build/device-spool/` and prints the newest events, memory samples
+      included. (The **Export spool** button on the debug screen is the
+      fallback.) Tell me it is there and I can read it.
 
 Record everything in [spike-results.md](spike-results.md) under M2.

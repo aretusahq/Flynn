@@ -21,15 +21,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use flynn_rules::Verdict;
-use flynn_types::{AppId, Platform};
+use flynn_rules::{Reason, Verdict};
+use flynn_types::{AppId, Platform, crc32};
 
 use crate::events::{CloseReason, Event, EventSink};
 use crate::mem::MemSample;
 use crate::{FlowKey, NameSource, StatsSnapshot, Transport};
 
 const MAGIC: &[u8; 4] = b"FLSP";
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 const HEADER_LEN: usize = 8;
 /// Records larger than this are corrupt by definition.
 const MAX_RECORD: usize = 64 * 1024;
@@ -294,6 +294,7 @@ const K_NAMED: u8 = 2;
 const K_CLOSED: u8 = 3;
 const K_DNS: u8 = 4;
 const K_SAMPLE: u8 = 5;
+const K_DECIDED: u8 = 6;
 
 fn encode(event: &Event, out: &mut Vec<u8>) {
     match event {
@@ -305,6 +306,7 @@ fn encode(event: &Event, out: &mut Vec<u8>) {
             source,
             app,
             verdict,
+            reason,
         } => {
             out.push(K_OPENED);
             put_u64(out, *id);
@@ -321,6 +323,7 @@ fn encode(event: &Event, out: &mut Vec<u8>) {
                 Verdict::Allow => 0,
                 Verdict::Block => 1,
             });
+            put_reason(out, *reason);
             match app {
                 None => out.push(0),
                 Some(app) => {
@@ -330,6 +333,21 @@ fn encode(event: &Event, out: &mut Vec<u8>) {
                     put_opt_str(out, app.display_name.as_deref());
                 }
             }
+        }
+        Event::FlowDecided {
+            id,
+            at_ms,
+            verdict,
+            reason,
+        } => {
+            out.push(K_DECIDED);
+            put_u64(out, *id);
+            put_i64(out, *at_ms);
+            out.push(match verdict {
+                Verdict::Allow => 0,
+                Verdict::Block => 1,
+            });
+            put_reason(out, *reason);
         }
         Event::FlowNamed { id, name, source } => {
             out.push(K_NAMED);
@@ -408,6 +426,7 @@ fn decode(payload: &[u8]) -> Option<Event> {
                 1 => Verdict::Block,
                 _ => return None,
             };
+            let reason = r.reason()?;
             let app = match r.u8()? {
                 0 => None,
                 _ => Some(AppId {
@@ -424,8 +443,19 @@ fn decode(payload: &[u8]) -> Option<Event> {
                 source,
                 app,
                 verdict,
+                reason,
             }
         }
+        K_DECIDED => Event::FlowDecided {
+            id: r.u64()?,
+            at_ms: r.i64()?,
+            verdict: match r.u8()? {
+                0 => Verdict::Allow,
+                1 => Verdict::Block,
+                _ => return None,
+            },
+            reason: r.reason()?,
+        },
         K_NAMED => Event::FlowNamed {
             id: r.u64()?,
             name: r.str()?,
@@ -501,6 +531,20 @@ fn put_ip(out: &mut Vec<u8>, ip: IpAddr) {
         }
     }
 }
+fn put_reason(out: &mut Vec<u8>, reason: Reason) {
+    match reason {
+        Reason::Panic => out.push(0),
+        Reason::Lockdown => out.push(1),
+        Reason::Rule { id } => {
+            out.push(2);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        Reason::Essential => out.push(3),
+        Reason::ModeDefault => out.push(4),
+        Reason::AwaitingName => out.push(5),
+    }
+}
+
 fn put_addr(out: &mut Vec<u8>, addr: SocketAddr) {
     put_ip(out, addr.ip());
     out.extend_from_slice(&addr.port().to_le_bytes());
@@ -616,39 +660,23 @@ impl<'a> Cursor<'a> {
             _ => None,
         }
     }
+    fn reason(&mut self) -> Option<Reason> {
+        Some(match self.u8()? {
+            0 => Reason::Panic,
+            1 => Reason::Lockdown,
+            2 => Reason::Rule {
+                id: u32::from_le_bytes(self.take(4)?.try_into().ok()?),
+            },
+            3 => Reason::Essential,
+            4 => Reason::ModeDefault,
+            5 => Reason::AwaitingName,
+            _ => return None,
+        })
+    }
     fn addr(&mut self) -> Option<SocketAddr> {
         let ip = self.ip()?;
         Some(SocketAddr::new(ip, self.u16()?))
     }
-}
-
-/// CRC-32 (IEEE 802.3), bitwise over a small table.
-fn crc32(data: &[u8]) -> u32 {
-    const TABLE: [u32; 16] = {
-        let mut t = [0u32; 16];
-        let mut i = 0;
-        while i < 16 {
-            let mut c = i as u32;
-            let mut k = 0;
-            while k < 4 {
-                c = if c & 1 != 0 {
-                    0xedb8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-                k += 1;
-            }
-            t[i] = c;
-            i += 1;
-        }
-        t
-    };
-    let mut crc = !0u32;
-    for &b in data {
-        crc = TABLE[((crc ^ u32::from(b)) & 0x0f) as usize] ^ (crc >> 4);
-        crc = TABLE[((crc ^ (u32::from(b) >> 4)) & 0x0f) as usize] ^ (crc >> 4);
-    }
-    !crc
 }
 
 #[cfg(test)]
@@ -680,6 +708,13 @@ mod tests {
                     display_name: None,
                 }),
                 verdict: Verdict::Allow,
+                reason: Reason::Rule { id: 7 },
+            },
+            Event::FlowDecided {
+                id: 1,
+                at_ms: 2,
+                verdict: Verdict::Block,
+                reason: Reason::Lockdown,
             },
             Event::FlowNamed {
                 id: 1,
@@ -712,11 +747,6 @@ mod tests {
                 reason: CloseReason::Normal,
             },
         ]
-    }
-
-    #[test]
-    fn crc32_matches_known_value() {
-        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
     }
 
     #[test]
@@ -753,7 +783,7 @@ mod tests {
             .unwrap();
         let (events, complete) = read_segment(&path).unwrap();
         assert!(!complete);
-        assert_eq!(events, samples()[..4].to_vec());
+        assert_eq!(events, samples()[..samples().len() - 1].to_vec());
         let _ = fs::remove_dir_all(&d);
     }
 

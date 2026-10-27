@@ -8,7 +8,17 @@ public struct TunnelOptions: Codable, Equatable, Sendable {
     }
 
     public var mode: Mode = .allowAll
-    /// Domains (and subdomains) blocked whatever the mode.
+    /// The rules, in the text form (docs/rules.md). The mode, the panic
+    /// switch and the essentials switch below override any `mode`, `panic`
+    /// or `essentials` line in the text.
+    public var rulesText: String = ""
+    /// Allows everything, lockdown included. The one-tap way out.
+    public var panic = false
+    /// Whether block-all keeps DNS, push, captive-portal checks, time and
+    /// certificate revocation reachable.
+    public var essentials = true
+    /// Superseded by `rulesText`; read once to migrate options saved by an
+    /// older build.
     public var blockedDomains: [String] = []
     public var recvBufferKiB: UInt32 = 16
     public var sendBufferKiB: UInt32 = 32
@@ -37,6 +47,9 @@ public struct TunnelOptions: Codable, Equatable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = TunnelOptions()
         mode = try c.decodeIfPresent(Mode.self, forKey: .mode) ?? d.mode
+        rulesText = try c.decodeIfPresent(String.self, forKey: .rulesText) ?? d.rulesText
+        panic = try c.decodeIfPresent(Bool.self, forKey: .panic) ?? d.panic
+        essentials = try c.decodeIfPresent(Bool.self, forKey: .essentials) ?? d.essentials
         blockedDomains = try c.decodeIfPresent([String].self, forKey: .blockedDomains) ?? d.blockedDomains
         recvBufferKiB = try c.decodeIfPresent(UInt32.self, forKey: .recvBufferKiB) ?? d.recvBufferKiB
         sendBufferKiB = try c.decodeIfPresent(UInt32.self, forKey: .sendBufferKiB) ?? d.sendBufferKiB
@@ -65,15 +78,33 @@ public struct TunnelOptions: Codable, Equatable, Sendable {
         }
     }
 
-    /// Settings for the Rust forwarder.
-    public func forwarderSettings() -> ForwarderSettings {
-        var s = defaultForwarderSettings()
-        s.mode = switch mode {
+    /// Moves a list of blocked domains saved by an older build into the rules
+    /// text, once.
+    public mutating func migrateBlockedDomains() {
+        guard rulesText.isEmpty, !blockedDomains.isEmpty else { return }
+        rulesText = blockedDomains.map { "block domain \($0)\nblock subdomains \($0)" }.joined(separator: "\n") + "\n"
+        blockedDomains = []
+    }
+
+    /// The rules for the snapshot the tunnel loads: the text, with the
+    /// controls laid over it. Throws with the line number if the text does
+    /// not parse.
+    public func rulesConfig() throws -> RulesConfig {
+        var config = try parseRulesText(text: rulesText)
+        config.mode = switch mode {
         case .allowAll: .allowAll
         case .blockAll: .blockAll
         case .lockdown: .lockdown
         }
-        s.blockedDomains = blockedDomains
+        config.panic = panic
+        config.essentials = essentials
+        return config
+    }
+
+    /// Settings for the Rust forwarder. The rules travel separately, in the
+    /// snapshot file.
+    public func forwarderSettings() -> ForwarderSettings {
+        var s = defaultForwarderSettings()
         s.tcpRecvBufferKib = recvBufferKiB
         s.tcpSendBufferKib = sendBufferKiB
         s.forceTcpForUnnamedQuic = forceTCPForUnnamedQUIC
@@ -90,6 +121,34 @@ public struct TunnelOptions: Codable, Equatable, Sendable {
 public enum TunnelRequest: String, Codable, Sendable {
     case stats
     case testNotification
+    /// Read the rules snapshot again and apply it now, to open flows too.
+    case reloadRules
+}
+
+/// The tunnel's answer to `TunnelRequest.reloadRules`.
+public struct RulesReloadReply: Codable, Sendable {
+    public var ok: Bool
+    public var generation: UInt64
+    public var ruleCount: UInt32
+    public var panic: Bool
+    /// Why the reload failed, when it did. The old rules stay in force.
+    public var error: String?
+
+    public init(info: RulesInfo) {
+        ok = true
+        generation = info.generation
+        ruleCount = info.ruleCount
+        panic = info.panic
+        error = nil
+    }
+
+    public init(error: String) {
+        ok = false
+        generation = 0
+        ruleCount = 0
+        panic = false
+        self.error = error
+    }
 }
 
 /// The tunnel's answer to `TunnelRequest.stats`.
@@ -108,8 +167,12 @@ public struct TunnelStatsReply: Codable, Sendable {
     public var spoolErrors: UInt64
     public var footprint: UInt64
     public var peakFootprint: UInt64
+    /// The rules in force.
+    public var rulesGeneration: UInt64
+    public var ruleCount: UInt32
+    public var rulesPanic: Bool
 
-    public init(running: Bool, stats: StatsSnapshot?, spoolErrors: UInt64, memory: MemSample) {
+    public init(running: Bool, stats: StatsSnapshot?, spoolErrors: UInt64, memory: MemSample, rules: RulesInfo?) {
         self.running = running
         packetsIn = stats?.packetsIn ?? 0
         packetsOut = stats?.packetsOut ?? 0
@@ -124,5 +187,8 @@ public struct TunnelStatsReply: Codable, Sendable {
         self.spoolErrors = spoolErrors
         footprint = memory.footprint
         peakFootprint = memory.peakFootprint
+        rulesGeneration = rules?.generation ?? 0
+        ruleCount = rules?.ruleCount ?? 0
+        rulesPanic = rules?.panic ?? false
     }
 }

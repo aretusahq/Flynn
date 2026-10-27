@@ -66,6 +66,38 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $(FLYNN_BUNDLE_PREFIX)
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 
+  # The same app without the tunnel, for a free Apple developer team, which
+  # cannot use Network Extensions or App Groups. Same sources and the same
+  # Rust core; no extensions, no entitlements, and a separate bundle ID so it
+  # cannot take over the real one in a team's namespace.
+  FlynnFree:
+    type: application
+    platform: iOS
+    sources:
+      - path: Flynn
+        excludes:
+          - Info.plist
+          - Flynn.entitlements
+    dependencies:
+      - package: FlynnKit
+    info:
+      path: FlynnFree/Info.plist
+      properties:
+        CFBundleDisplayName: Flynn (free test)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(FLYNN_BUNDLE_PREFIX).freetest
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) FLYNN_NO_TUNNEL"
+
   FlynnTunnel:
     type: app-extension
     platform: iOS
@@ -138,6 +170,14 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $(FLYNN_BUNDLE_PREFIX).filter-control
 
 schemes:
+  FlynnFree:
+    build:
+      targets:
+        FlynnFree: all
+    run:
+      config: Debug
+    archive:
+      config: Release
   Flynn:
     build:
       targets:

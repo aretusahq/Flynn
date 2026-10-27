@@ -512,6 +512,8 @@ name = "flynn-rules"
 version = "0.1.0"
 dependencies = [
  "flynn-types",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]

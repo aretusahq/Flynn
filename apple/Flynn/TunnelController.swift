@@ -15,6 +15,10 @@ final class TunnelController {
         didSet { Self.saveOptions(options) }
     }
     private(set) var lastError: String?
+    /// Why the rules text or snapshot was refused, if it was.
+    private(set) var rulesError: String?
+    /// What the last save or reload did, for the screen.
+    private(set) var rulesStatus: String?
     private(set) var stats: TunnelStatsReply?
     private(set) var events: [SpoolEvent] = []
     private(set) var latestSample: (mem: MemSample, stats: StatsSnapshot, atMs: Int64)?
@@ -26,14 +30,30 @@ final class TunnelController {
     let spoolDirectory = SharedContainer.appGroup()?.spoolDirectory
 
     init() {
-        options = Self.loadOptions()
+        var loaded = Self.loadOptions()
+        loaded.migrateBlockedDomains()
+        options = loaded
+        Self.saveOptions(loaded)
     }
+
+    /// False in the free-team test build, which has no Network Extension
+    /// entitlement: it cannot create a VPN configuration at all.
+    static let tunnelAvailable: Bool = {
+        #if FLYNN_NO_TUNNEL
+        return false
+        #else
+        return true
+        #endif
+    }()
+
+    static let noTunnelMessage = "This build has no tunnel: a free Apple developer team cannot use Network Extensions."
 
     var isActive: Bool {
         status == .connected || status == .connecting || status == .reasserting
     }
 
     func load() async {
+        guard Self.tunnelAvailable else { return }
         do {
             let managers = try await NETunnelProviderManager.loadAllFromPreferences()
             manager = managers.first
@@ -53,6 +73,10 @@ final class TunnelController {
     /// Writes the current options into the VPN configuration, creating it
     /// on first use. iOS asks the user to allow the configuration once.
     func apply() async {
+        guard Self.tunnelAvailable else {
+            lastError = Self.noTunnelMessage
+            return
+        }
         do {
             let manager = self.manager ?? NETunnelProviderManager()
             let proto = (manager.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
@@ -87,6 +111,11 @@ final class TunnelController {
     }
 
     func start() async {
+        guard Self.tunnelAvailable else {
+            lastError = Self.noTunnelMessage
+            return
+        }
+        await applyRules()
         await apply()
         guard let manager else { return }
         do {
@@ -132,8 +161,54 @@ final class TunnelController {
         }
     }
 
+    /// Writes the current rules as the snapshot the tunnel loads, and, if the
+    /// tunnel is up, has it swap them in now. Open connections are checked
+    /// against them at once, which is what lets lockdown and the panic switch
+    /// cut what is already connected.
+    func applyRules() async {
+        rulesError = nil
+        guard Self.tunnelAvailable, let container = SharedContainer.appGroup() else { return }
+        let config: RulesConfig
+        do {
+            config = try options.rulesConfig()
+        } catch {
+            rulesError = explain(error)
+            return
+        }
+        do {
+            try writeRuleSnapshot(
+                path: container.ruleSnapshot.path(percentEncoded: false),
+                config: config,
+                generation: UInt64(Date().timeIntervalSince1970 * 1000)
+            )
+        } catch {
+            rulesError = "Saving the rules failed: \(explain(error))"
+            return
+        }
+        guard status == .connected, let data = await send(.reloadRules),
+              let reply = try? JSONDecoder().decode(RulesReloadReply.self, from: data) else {
+            rulesStatus = "Saved. They apply when the tunnel starts."
+            return
+        }
+        if reply.ok {
+            rulesStatus = "Applied now: \(reply.ruleCount) rules\(reply.panic ? ", panic on" : "")."
+        } else {
+            rulesError = "The tunnel kept its old rules: \(reply.error ?? "unknown error")"
+        }
+    }
+
+    /// The one-tap way out: allow everything, whatever else is set.
+    func setPanic(_ on: Bool) async {
+        options.panic = on
+        await applyRules()
+    }
+
     /// Asks for notification permission, then has the extension post one.
     func testNotification() async {
+        guard Self.tunnelAvailable else {
+            lastError = Self.noTunnelMessage
+            return
+        }
         do {
             let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
             guard granted else {

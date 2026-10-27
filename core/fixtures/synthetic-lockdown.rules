@@ -1,0 +1,3 @@
+# Lockdown seals everything, DNS and allow rules included.
+mode lockdown
+allow any

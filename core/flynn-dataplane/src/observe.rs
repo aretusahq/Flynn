@@ -1,16 +1,16 @@
 //! Passive flow tracking: the same naming and decisions as the forwarder,
 //! applied to packets that are only watched, not relayed. Used by pcap
-//! replay, so a capture checks parsing, naming and flow accounting without
-//! a live network.
+//! replay, so a capture checks parsing, naming, rules and flow accounting
+//! without a live network.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use flynn_proto::{dns, ip, quic, tls, transport};
-use flynn_rules::Verdict;
+use flynn_rules::{NameState, Reason, Verdict};
 
 use crate::names::{DnsCache, NameSource};
-use crate::policy::{FlowMeta, Policy};
+use crate::policy::{FlowMeta, Policy, Standing};
 use crate::{FlowKey, Transport};
 
 /// One flow as seen in a capture, oriented client to server.
@@ -19,7 +19,9 @@ pub struct FlowSummary {
     pub key: FlowKey,
     pub name: Option<String>,
     pub source: NameSource,
+    /// The final verdict, after the server name (or its absence) settled it.
     pub verdict: Verdict,
+    pub reason: Reason,
     pub quic: bool,
     pub packets_up: u64,
     pub packets_down: u64,
@@ -42,10 +44,34 @@ pub struct FlowTracker {
 struct Tracked {
     order: usize,
     summary: FlowSummary,
+    standing: Standing,
     hello: Vec<u8>,
     sniffing: bool,
     /// Reads the server name from a QUIC flow's Initial packets.
     quic: Option<quic::InitialSniffer>,
+}
+
+/// Decides again and copies the result into the summary.
+fn redecide(policy: &dyn Policy, t: &mut Tracked, name: NameState<'_>) {
+    let decision = policy.decide(&FlowMeta {
+        key: &t.summary.key,
+        name,
+        app: None,
+    });
+    t.standing.update(decision);
+    t.summary.verdict = t.standing.verdict;
+    t.summary.reason = t.standing.reason;
+}
+
+/// No server name is coming: decide with what is known (a name from DNS, or
+/// none).
+fn settle_without_name(policy: &dyn Policy, t: &mut Tracked) {
+    let name = t.summary.name.clone();
+    let state = match &name {
+        Some(n) => NameState::Known(n),
+        None => NameState::Unavailable,
+    };
+    redecide(policy, t, state);
 }
 
 impl FlowTracker {
@@ -122,11 +148,21 @@ impl FlowTracker {
 
         if !self.flows.contains_key(&flow_key) {
             let name = self.names.lookup(&flow_key.dst.ip()).map(str::to_owned);
-            let verdict = self.policy.decide(&FlowMeta {
+            // A name may still come: from a ClientHello over TCP, or from a
+            // QUIC Initial.
+            let can_name = flow_key.protocol == Transport::Tcp
+                || (flow_key.dst.port() == 443 && quic::initial_version(payload).is_some());
+            let state = match &name {
+                Some(n) => NameState::Known(n),
+                None if can_name => NameState::Pending,
+                None => NameState::Unavailable,
+            };
+            let decision = self.policy.decide(&FlowMeta {
                 key: &flow_key,
-                name: name.as_deref(),
+                name: state,
                 app: None,
             });
+            let standing = Standing::from_decision(decision);
             let order = self.next_order;
             self.next_order += 1;
             self.flows.insert(
@@ -141,7 +177,8 @@ impl FlowTracker {
                             NameSource::None
                         },
                         name,
-                        verdict,
+                        verdict: standing.verdict,
+                        reason: standing.reason,
                         quic: false,
                         packets_up: 0,
                         packets_down: 0,
@@ -150,6 +187,7 @@ impl FlowTracker {
                         first_ms: at_ms,
                         last_ms: at_ms,
                     },
+                    standing,
                     hello: Vec::new(),
                     sniffing: flow_key.protocol == Transport::Tcp,
                     quic: None,
@@ -161,43 +199,38 @@ impl FlowTracker {
         let Some(flow) = self.flows.get_mut(&flow_key) else {
             return;
         };
-        let s = &mut flow.summary;
-        s.last_ms = at_ms;
+        flow.summary.last_ms = at_ms;
         if up {
-            s.packets_up += 1;
-            s.bytes_up += payload.len() as u64;
+            flow.summary.packets_up += 1;
+            flow.summary.bytes_up += payload.len() as u64;
         } else {
-            s.packets_down += 1;
-            s.bytes_down += payload.len() as u64;
+            flow.summary.packets_down += 1;
+            flow.summary.bytes_down += payload.len() as u64;
         }
 
         if up && !payload.is_empty() {
-            if s.key.protocol == Transport::Udp
-                && s.key.dst.port() == 443
+            if flow.summary.key.protocol == Transport::Udp
+                && flow.summary.key.dst.port() == 443
                 && quic::initial_version(payload).is_some()
             {
-                if !s.quic {
+                if !flow.summary.quic {
                     flow.quic = Some(quic::InitialSniffer::new());
                 }
-                s.quic = true;
+                flow.summary.quic = true;
             }
+            let mut found: Option<String> = None;
+            let mut gave_up = false;
             if let Some(sniffer) = flow.quic.as_mut() {
                 match sniffer.feed(payload) {
                     quic::QuicSni::Incomplete => {}
                     quic::QuicSni::Found(name) => {
-                        if policy.decide(&FlowMeta {
-                            key: &s.key,
-                            name: Some(&name),
-                            app: None,
-                        }) == Verdict::Block
-                        {
-                            s.verdict = Verdict::Block;
-                        }
-                        s.name = Some(name);
-                        s.source = NameSource::Sni;
+                        found = Some(name);
                         flow.quic = None;
                     }
-                    _ => flow.quic = None,
+                    _ => {
+                        gave_up = true;
+                        flow.quic = None;
+                    }
                 }
             }
             if flow.sniffing {
@@ -205,33 +238,38 @@ impl FlowTracker {
                 match tls::client_hello_sni(&flow.hello) {
                     tls::Sni::Incomplete if flow.hello.len() < tls::MAX_CLIENT_HELLO => {}
                     tls::Sni::Found(name) => {
-                        let name = name.to_ascii_lowercase();
-                        if policy.decide(&FlowMeta {
-                            key: &s.key,
-                            name: Some(&name),
-                            app: None,
-                        }) == Verdict::Block
-                        {
-                            s.verdict = Verdict::Block;
-                        }
-                        s.name = Some(name);
-                        s.source = NameSource::Sni;
+                        found = Some(name.to_ascii_lowercase());
                         flow.sniffing = false;
                         flow.hello = Vec::new();
                     }
                     _ => {
+                        gave_up = true;
                         flow.sniffing = false;
                         flow.hello = Vec::new();
                     }
                 }
             }
+            if let Some(name) = found {
+                flow.summary.name = Some(name.clone());
+                flow.summary.source = NameSource::Sni;
+                redecide(&*policy, flow, NameState::Known(&name));
+            } else if gave_up {
+                settle_without_name(&*policy, flow);
+            }
         }
     }
 
-    /// Flows in the order they were first seen.
+    /// Flows in the order they were first seen. Any still waiting for a name
+    /// that never came are settled without one.
     pub fn finish(self) -> Vec<FlowSummary> {
+        let policy = self.policy.clone();
         let mut flows: Vec<Tracked> = self.flows.into_values().collect();
         flows.sort_by_key(|f| f.order);
+        for f in &mut flows {
+            if f.standing.awaiting_name {
+                settle_without_name(&*policy, f);
+            }
+        }
         flows.into_iter().map(|f| f.summary).collect()
     }
 }
@@ -239,7 +277,7 @@ impl FlowTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{DomainBlocklist, ModePolicy};
+    use crate::policy::RulesPolicy;
     use flynn_proto::build;
     use flynn_proto::transport::TcpFlags;
     use flynn_rules::Mode;
@@ -249,9 +287,13 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn allow_all() -> Arc<dyn Policy> {
+        Arc::new(RulesPolicy::allow_all())
+    }
+
     #[test]
     fn names_tcp_flow_from_dns_then_sni_and_counts_both_ways() {
-        let mut t = FlowTracker::new(Arc::new(ModePolicy(Mode::AllowAll)));
+        let mut t = FlowTracker::new(allow_all());
         let (client, resolver, server) = (
             addr("10.0.0.2:5353"),
             addr("10.0.0.1:53"),
@@ -302,11 +344,15 @@ mod tests {
         assert_eq!(tcp.source, NameSource::Sni);
         assert_eq!((tcp.packets_up, tcp.packets_down), (2, 2));
         assert_eq!(tcp.bytes_down, 100);
+        assert_eq!(
+            (tcp.verdict, tcp.reason),
+            (Verdict::Allow, Reason::ModeDefault)
+        );
     }
 
     #[test]
     fn sni_can_block_a_flow_dns_allowed() {
-        let mut t = FlowTracker::new(Arc::new(DomainBlocklist::new(["ads.example"])));
+        let mut t = FlowTracker::new(Arc::new(RulesPolicy::blocking_domains(["ads.example"])));
         let (app, server) = (addr("10.0.0.2:50000"), addr("1.2.3.4:443"));
         t.observe(0, &build::tcp_packet(app, server, 1, 0, TcpFlags::SYN, &[]));
         t.observe(
@@ -322,11 +368,13 @@ mod tests {
         );
         let flows = t.finish();
         assert_eq!(flows[0].verdict, Verdict::Block);
+        // Rule 2 is the subdomains rule that blocking_domains adds.
+        assert_eq!(flows[0].reason, Reason::Rule { id: 2 });
     }
 
     #[test]
     fn flags_quic_initial() {
-        let mut t = FlowTracker::new(Arc::new(ModePolicy(Mode::AllowAll)));
+        let mut t = FlowTracker::new(allow_all());
         t.observe(
             0,
             &build::udp_packet(
@@ -336,5 +384,66 @@ mod tests {
             ),
         );
         assert!(t.finish()[0].quic);
+    }
+
+    #[test]
+    fn block_all_waits_for_the_name_then_applies_the_rules() {
+        use flynn_rules::{Action, Config, Dest, Rule};
+        let config = Config {
+            mode: Mode::BlockAll,
+            panic: false,
+            essentials: true,
+            rules: vec![Rule {
+                id: 7,
+                action: Action::Allow,
+                dest: Dest::Domain("www.example.com".into()),
+                app: None,
+                ports: None,
+                transport: None,
+            }],
+        };
+        let mut t = FlowTracker::new(Arc::new(RulesPolicy::from_config(&config).unwrap()));
+        let server = addr("93.184.216.34:443");
+        // A flow whose ClientHello names the allowed site.
+        let named = addr("10.0.0.2:50000");
+        t.observe(
+            0,
+            &build::tcp_packet(named, server, 1, 0, TcpFlags::SYN, &[]),
+        );
+        t.observe(
+            1,
+            &build::tcp_packet(
+                named,
+                server,
+                2,
+                0,
+                TcpFlags::ACK,
+                &build::client_hello(Some("www.example.com"), 0),
+            ),
+        );
+        // A flow that never sends a ClientHello: no name ever comes.
+        let silent = addr("10.0.0.2:50001");
+        t.observe(
+            2,
+            &build::tcp_packet(silent, server, 1, 0, TcpFlags::SYN, &[]),
+        );
+        // DNS is essential, whatever the name.
+        t.observe(
+            3,
+            &build::udp_packet(addr("10.0.0.2:5000"), addr("10.0.0.1:53"), &[0; 12]),
+        );
+        let flows = t.finish();
+        assert_eq!(
+            (flows[0].verdict, flows[0].reason),
+            (Verdict::Allow, Reason::Rule { id: 7 })
+        );
+        assert_eq!(
+            (flows[1].verdict, flows[1].reason),
+            (Verdict::Block, Reason::ModeDefault)
+        );
+        assert_eq!(
+            (flows[2].verdict, flows[2].reason),
+            (Verdict::Allow, Reason::Essential)
+        );
     }
 }

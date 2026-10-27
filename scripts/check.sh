@@ -18,9 +18,12 @@ cargo clippy --workspace --all-targets --quiet -- -D warnings
 step "Rust: tests"
 cargo test --workspace --quiet
 
-step "Replay fixture: synthetic-basic"
-cargo run --quiet -p flynn-harness -- replay fixtures/synthetic-basic.pcap \
-    --block tracker.test --expect fixtures/synthetic-basic.expected.txt >/dev/null
+step "Replay fixtures: the synthetic capture under each rules file"
+for rules in fixtures/synthetic-*.rules; do
+    name="$(basename "$rules" .rules)"
+    cargo run --quiet -p flynn-harness -- replay fixtures/synthetic-basic.pcap \
+        --rules "$rules" --expect "fixtures/$name.expected.txt" >/dev/null
+done
 
 # Deeper than the property tests; needs nightly and cargo-fuzz, so optional.
 if cargo +nightly fuzz --version >/dev/null 2>&1; then
@@ -49,8 +52,12 @@ step "Swift: FlynnKit tests on $SIM"
 xcodebuild test -quiet -project apple/Flynn.xcodeproj -scheme Flynn \
     -destination "platform=iOS Simulator,name=$SIM" -derivedDataPath "$DERIVED"
 
-step "Swift: unsigned device build"
-xcodebuild build -quiet -project apple/Flynn.xcodeproj -scheme Flynn \
-    -destination 'generic/platform=iOS' -derivedDataPath "$DERIVED" CODE_SIGNING_ALLOWED=NO
+step "Swift: unsigned device builds (full app, and the free-team test build)"
+# Its own folder: device-install.sh signs into build/DerivedData, and an
+# unsigned build must never overwrite that.
+for scheme in Flynn FlynnFree; do
+    xcodebuild build -quiet -project apple/Flynn.xcodeproj -scheme "$scheme" \
+        -destination 'generic/platform=iOS' -derivedDataPath "$BUILD/DerivedData-unsigned" CODE_SIGNING_ALLOWED=NO
+done
 
 step "All checks passed"

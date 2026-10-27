@@ -19,13 +19,13 @@ use std::sync::Arc;
 use flynn_types::Capabilities;
 
 pub use events::{CloseReason, Event, EventSink, FlowId, NullSink};
-pub use forwarder::{ForwarderConfig, ForwarderHandle, StatsSnapshot};
+pub use forwarder::{DropBreakdown, ForwarderConfig, ForwarderHandle, PacketPusher, StatsSnapshot};
 pub use host::{
     AppResolver, Clock, FlowKey, HostError, Notifier, PacketIo, Paths, SocketProtector, Transport,
 };
 pub use mem::MemSample;
 pub use names::NameSource;
-pub use policy::{DomainBlocklist, FlowMeta, ModePolicy, Policy};
+pub use policy::{FlowMeta, LoadError, Policy, RulesPolicy, load_rules, provisional};
 
 /// Everything the platform supplies to a data plane.
 #[derive(Clone)]
