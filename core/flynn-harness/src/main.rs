@@ -1,15 +1,22 @@
 //! Host harness for the data plane on macOS.
 //!
-//!   flynn-harness replay <file.pcap> [--block DOMAIN]... [--expect FILE]
+//!   flynn-harness replay <file.pcap> [RULES] [--expect FILE]
 //!       Run a capture (pcap or pcapng) through the parsers, naming and
-//!       policy, and print one line per flow. With --expect, compare the
-//!       output with FILE and exit 1 on any difference.
+//!       rules, and print one line per flow with its verdict and why. With
+//!       --expect, compare the output with FILE and exit 1 on any difference.
 //!
-//!   sudo flynn-harness live [--route CIDR]... [--all] [--block DOMAIN]...
+//!   sudo flynn-harness live [--route CIDR]... [--all] [RULES]
 //!       [--interface en0] [--events] [--stats-every SECS]
 //!       [--recv-buffer KIB] [--send-buffer KIB] [--spool DIR] [--force-tcp-quic]
 //!       Open a utun interface, route traffic into it, and relay it through
-//!       the forwarder, printing throughput, flows and memory.
+//!       the forwarder, printing throughput, flows and memory. Edit the
+//!       --rules file while it runs and the new rules apply at once,
+//!       open connections included.
+//!
+//!   RULES is any of: --rules FILE (the text form, docs/rules.md)
+//!       --mode allow-all|block-all|lockdown   --block DOMAIN   --allow DOMAIN
+//!       --no-essentials   --panic
+//!   --block and --allow cover the domain and everything under it.
 //!
 //!   flynn-harness spool-tail <dir> [COUNT]
 //!       Print the newest events in a spool directory (from `live --spool`
@@ -27,14 +34,13 @@ mod fixture;
 mod live;
 mod pcap;
 mod replay;
+mod rulesarg;
 #[cfg(target_os = "macos")]
 mod utun;
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
-use flynn_dataplane::{DomainBlocklist, ModePolicy, Policy};
-use flynn_rules::Mode;
+use rulesarg::RulesArgs;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -60,10 +66,12 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage:
-  flynn-harness replay <file.pcap> [--block DOMAIN]... [--expect FILE]
-  sudo flynn-harness live [--route CIDR]... [--all] [--block DOMAIN]... [--interface IF]
+  flynn-harness replay <file.pcap> [RULES] [--expect FILE]
+  sudo flynn-harness live [--route CIDR]... [--all] [RULES] [--interface IF]
                           [--events] [--stats-every SECS] [--recv-buffer KIB] [--send-buffer KIB]
                           [--spool DIR] [--force-tcp-quic]
+  RULES: [--rules FILE] [--mode allow-all|block-all|lockdown] [--block DOMAIN]...
+         [--allow DOMAIN]... [--no-essentials] [--panic]
   flynn-harness spool-tail <dir> [COUNT]
   flynn-harness demo-spool <dir>
   flynn-harness gen-fixture <out.pcap>
@@ -114,22 +122,31 @@ impl Args {
     }
 }
 
-fn policy(blocks: Vec<String>) -> Arc<dyn Policy> {
-    if blocks.is_empty() {
-        Arc::new(ModePolicy(Mode::AllowAll))
-    } else {
-        Arc::new(DomainBlocklist::new(blocks))
-    }
+/// The flags every command that applies rules shares.
+const RULE_FLAGS: &[&str] = &["--rules", "--mode", "--block", "--allow"];
+
+fn rules_args(a: &Args) -> Result<RulesArgs, String> {
+    Ok(RulesArgs {
+        file: a.one("--rules").map(std::path::PathBuf::from),
+        mode: a
+            .one("--mode")
+            .map(|m| rulesarg::parse_mode(&m))
+            .transpose()?,
+        block: a.all("--block"),
+        allow: a.all("--allow"),
+        no_essentials: a.has("--no-essentials"),
+        panic: a.has("--panic"),
+    })
 }
 
 fn cmd_replay(args: &[String]) -> CmdResult {
-    let a = parse(args, &["--block", "--expect"])?;
+    let a = parse(args, &[RULE_FLAGS, &["--expect"][..]].concat())?;
     let [path] = a.positional.as_slice() else {
         return Err("replay takes one capture file".into());
     };
     let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     let capture = pcap::read(&data).map_err(|e| format!("{path}: {e}"))?;
-    let report = replay::report(&capture, policy(a.all("--block")));
+    let report = replay::report(&capture, rules_args(&a)?.policy()?);
     print!("{report}");
     if let Some(expect) = a.one("--expect") {
         let want = std::fs::read_to_string(&expect).map_err(|e| format!("{expect}: {e}"))?;
@@ -177,15 +194,27 @@ fn describe(e: &flynn_dataplane::Event) -> String {
             name,
             source,
             verdict,
+            reason,
             ..
         } => format!(
-            "{at_ms} open  #{id} {:?} {} -> {} {} ({}) {:?}",
+            "{at_ms} open  #{id} {:?} {} -> {} {} ({}) {:?} {}",
             key.protocol,
             key.src,
             key.dst,
             name.as_deref().unwrap_or("-"),
             source.as_str(),
-            verdict
+            verdict,
+            replay::why(*reason)
+        ),
+        Event::FlowDecided {
+            id,
+            at_ms,
+            verdict,
+            reason,
+        } => format!(
+            "{at_ms} decide #{id} {:?} {}",
+            verdict,
+            replay::why(*reason)
         ),
         Event::FlowNamed { id, name, source } => {
             format!("     name  #{id} {name} ({})", source.as_str())
@@ -226,7 +255,11 @@ fn cmd_demo_spool(args: &[String]) -> CmdResult {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
-    let mut tracker = FlowTracker::new(policy(vec!["tracker.test".into()]));
+    let demo_rules = RulesArgs {
+        block: vec!["tracker.test".into()],
+        ..RulesArgs::default()
+    };
+    let mut tracker = FlowTracker::new(demo_rules.policy()?);
     let packets = fixture::basic();
     let first = packets.first().map_or(0, |p| p.at_ms);
     for p in &packets {
@@ -238,32 +271,42 @@ fn cmd_demo_spool(args: &[String]) -> CmdResult {
         let id = i as u64 + 1;
         let shift = |t: i64| now - 60_000 + (t - first);
         let blocked = f.verdict == flynn_rules::Verdict::Block;
+        // As the forwarder logs it: a flow named only by its ClientHello
+        // opens awaiting the name, then gets a decision.
+        let sni_named = f.source == NameSource::Sni;
         events.push(Event::FlowOpened {
             id,
             at_ms: shift(f.first_ms),
             key: f.key,
-            name: if f.source == NameSource::Sni {
-                None
-            } else {
-                f.name.clone()
-            },
-            source: if f.source == NameSource::Sni {
+            name: if sni_named { None } else { f.name.clone() },
+            source: if sni_named {
                 NameSource::None
             } else {
                 f.source
             },
             app: None,
-            verdict: if f.source == NameSource::Sni {
+            verdict: if sni_named {
                 flynn_rules::Verdict::Allow
             } else {
                 f.verdict
             },
+            reason: if sni_named {
+                flynn_rules::Reason::AwaitingName
+            } else {
+                f.reason
+            },
         });
-        if f.source == NameSource::Sni {
+        if sni_named {
             events.push(Event::FlowNamed {
                 id,
                 name: f.name.clone().unwrap_or_default(),
                 source: NameSource::Sni,
+            });
+            events.push(Event::FlowDecided {
+                id,
+                at_ms: shift(f.first_ms) + 1,
+                verdict: f.verdict,
+                reason: f.reason,
             });
         }
         events.push(Event::FlowClosed {
@@ -317,14 +360,17 @@ fn cmd_live(args: &[String]) -> CmdResult {
     let a = parse(
         args,
         &[
-            "--route",
-            "--block",
-            "--interface",
-            "--stats-every",
-            "--recv-buffer",
-            "--send-buffer",
-            "--spool",
-        ],
+            RULE_FLAGS,
+            &[
+                "--route",
+                "--interface",
+                "--stats-every",
+                "--recv-buffer",
+                "--send-buffer",
+                "--spool",
+            ][..],
+        ]
+        .concat(),
     )?;
     let num = |flag: &str, default: u64| -> Result<u64, String> {
         a.one(flag).map_or(Ok(default), |v| {
@@ -337,7 +383,7 @@ fn cmd_live(args: &[String]) -> CmdResult {
         interface: a.one("--interface"),
         print_events: a.has("--events"),
         stats_every: std::time::Duration::from_secs(num("--stats-every", 5)?.max(1)),
-        policy: policy(a.all("--block")),
+        rules: rules_args(&a)?,
         recv_buffer: num("--recv-buffer", 16)? as usize * 1024,
         send_buffer: num("--send-buffer", 32)? as usize * 1024,
         spool: a.one("--spool").map(std::path::PathBuf::from),

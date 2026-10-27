@@ -1,0 +1,4 @@
+# Block-all: nothing gets through unless a rule or the essentials allow it.
+mode block-all
+allow subdomains example.com
+allow domain video.example.net

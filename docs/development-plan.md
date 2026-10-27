@@ -99,14 +99,21 @@ Each one ends with its exit criteria. "Human:" marks steps Claude can't do.
 - **Human:** enrol in the Apple Developer Program, register bundle IDs, the App Group and Network Extension capabilities (packet-tunnel-provider, content-filter-provider), and give Claude the Team ID. Steps are in `docs/device-checklists.md`.
 - Exit: `scripts/check.sh` passes (including the core compiling for `aarch64-linux-android` and Kotlin bindings generating), and the empty app plus extensions build for a device.
 
-### M1 — Spike A: forwarder on the host (highest risk in the build) (code done 19 Oct; live run pending)
+### M1 — Spike A: forwarder on the host (highest risk in the build) (done; live runs 19 to 27 Oct, results in spike-results.md; video streaming and a video call not yet confirmed)
 - `flynn-proto` parsers for IPv4/IPv6/TCP/UDP/DNS/SNI, with fuzz targets.
 - `flynn-dataplane` forwarder: smoltcp terminates TCP locally and opens matching outbound sockets. UDP is relayed with flow timeouts. DNS is intercepted and logged.
 - `flynn-harness`: pcap replay to check the parsers and flow accounting, plus a live `utun` mode that routes the Mac's traffic through the forwarder.
 - **Human:** run the harness live with sudo and browse normally for 30 minutes.
 - Exit: pages load, video streams, and throughput, CPU and RSS are recorded in `docs/spike-results.md`.
 
-### M2 — Spike B: packet tunnel on the iPhone (unsupervised) (code done 19 Oct; device runs pending)
+### M2 — Spike B: packet tunnel on the iPhone (unsupervised) (code done 19 Oct; device runs blocked on a paid Apple team)
+
+> **Blocked, 27 Oct:** Xcode refuses the Network Extensions capability for a
+> personal (free) team, so the tunnel cannot be signed until a paid Apple
+> Developer Program team is available. M4 to M6 do not need a device and can
+> go first. Meanwhile the `FlynnFree` target (same app, no tunnel, bundle ID
+> `io.aretusa.flynn.freetest`) installs with a free team and runs an
+> on-device self-test of the core; see device-checklists.md.
 - A minimal tunnel extension around the M1 data plane, logging domain, IP, port and bytes to the spool, and a debug screen in the app that tails it.
 - Measure: peak and steady memory in the extension (`task_vm_info` sampled to the spool), battery over 24 hours, and throughput against Flynn off.
 - Try out: notifications posted from the extension, `includeAllNetworks` + `enforceRoutes`, on-demand rules restarting the tunnel after reboot or kill, and whether the device receives any unsolicited inbound traffic.
@@ -121,7 +128,14 @@ Each one ends with its exit criteria. "Human:" marks steps Claude can't do.
 - Look at the App Privacy Report export format as a per-app fallback on the iPhone.
 - **Gate:** write go/no-go results to `docs/spike-results.md` and update Flynn-plan.md's feasibility labels. The human decides whether the combined mode is in scope.
 
-### M4 — Core data plane, production quality
+### M4 — Core data plane, production quality (rules engine done 27 Oct; see docs/rules.md)
+
+> **Status:** rules by app/domain/wildcard/IP-CIDR/port, precedence, modes,
+> essentials, versioned snapshot, hot reload (open flows re-decided, <10 ms on
+> the Mac), property tests against a reference, and five replay fixtures are
+> done and in `scripts/check.sh`. Deferred: flow-table LRU and coalescing
+> (wait for device data), fuzz runs (cargo-fuzz not installed). The device
+> try-out is in device-checklists.md.
 - `flynn-rules`: rules by app, domain (exact and `*.` wildcard), host, IP/CIDR and port. Precedence is block over allow, specific over general, then mode default. A versioned snapshot format, property tests for precedence, and a bundled essentials list (Apple push, captive portal, time, OCSP).
 - Flow table with an LRU cap, coalescing of repeated connections (one row + a counter, a lever from the doc), and batched spool writes.
 - Hot rule reload through the provider message.

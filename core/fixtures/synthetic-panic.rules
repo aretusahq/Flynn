@@ -1,0 +1,4 @@
+# The panic switch beats lockdown and every block rule.
+mode lockdown
+panic on
+block any

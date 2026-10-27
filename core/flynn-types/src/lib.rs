@@ -4,6 +4,43 @@
 //! identifiers into these types at the boundary, so rules, the store and
 //! exports read the same on every platform.
 
+/// Transport protocol of a flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Transport {
+    Tcp,
+    Udp,
+}
+
+/// CRC-32 (IEEE 802.3). The event spool and the rule snapshot use it to
+/// notice a torn or corrupted file.
+pub fn crc32(data: &[u8]) -> u32 {
+    const TABLE: [u32; 16] = {
+        let mut t = [0u32; 16];
+        let mut i = 0;
+        while i < 16 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 4 {
+                c = if c & 1 != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                k += 1;
+            }
+            t[i] = c;
+            i += 1;
+        }
+        t
+    };
+    let mut crc = !0u32;
+    for &b in data {
+        crc = TABLE[((crc ^ u32::from(b)) & 0x0f) as usize] ^ (crc >> 4);
+        crc = TABLE[((crc ^ (u32::from(b) >> 4)) & 0x0f) as usize] ^ (crc >> 4);
+    }
+    !crc
+}
+
 /// The operating system a host runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Platform {
@@ -101,6 +138,12 @@ pub enum OsExemptKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crc32_matches_the_standard_check_value() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
 
     #[test]
     fn app_id_keys_on_platform_and_id() {

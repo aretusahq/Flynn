@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use flynn_dataplane::observe::{FlowSummary, FlowTracker};
 use flynn_dataplane::{Policy, Transport};
-use flynn_rules::Verdict;
+use flynn_rules::{Reason, Verdict};
 
 use crate::pcap::Capture;
 
@@ -26,6 +26,18 @@ pub fn report(capture: &Capture, policy: Arc<dyn Policy>) -> String {
     out
 }
 
+/// A reason as it reads in logs: `rule#3`, `default`, `essential`...
+pub fn why(reason: Reason) -> String {
+    match reason {
+        Reason::Panic => "panic".into(),
+        Reason::Lockdown => "lockdown".into(),
+        Reason::Rule { id } => format!("rule#{id}"),
+        Reason::Essential => "essential".into(),
+        Reason::ModeDefault => "default".into(),
+        Reason::AwaitingName => "awaiting-name".into(),
+    }
+}
+
 fn line(f: &FlowSummary) -> String {
     let proto = match f.key.protocol {
         Transport::Tcp => "tcp",
@@ -40,9 +52,10 @@ fn line(f: &FlowSummary) -> String {
         Verdict::Block => "block",
     };
     format!(
-        "{proto} {} -> {} name={name} verdict={verdict}{} up={}p/{}B down={}p/{}B",
+        "{proto} {} -> {} name={name} verdict={verdict} why={}{} up={}p/{}B down={}p/{}B",
         f.key.src,
         f.key.dst,
+        why(f.reason),
         if f.quic { " quic" } else { "" },
         f.packets_up,
         f.bytes_up,
@@ -55,10 +68,39 @@ fn line(f: &FlowSummary) -> String {
 mod tests {
     use super::*;
     use crate::{fixture, pcap};
-    use flynn_dataplane::DomainBlocklist;
+    use flynn_dataplane::RulesPolicy;
 
     const PCAP: &[u8] = include_bytes!("../../fixtures/synthetic-basic.pcap");
-    const EXPECTED: &str = include_str!("../../fixtures/synthetic-basic.expected.txt");
+
+    /// Each case replays the same capture under a rules file and must give
+    /// the checked-in output: name, rules, expected.
+    const CASES: &[(&str, &str, &str)] = &[
+        (
+            "basic",
+            include_str!("../../fixtures/synthetic-basic.rules"),
+            include_str!("../../fixtures/synthetic-basic.expected.txt"),
+        ),
+        (
+            "blockall",
+            include_str!("../../fixtures/synthetic-blockall.rules"),
+            include_str!("../../fixtures/synthetic-blockall.expected.txt"),
+        ),
+        (
+            "lockdown",
+            include_str!("../../fixtures/synthetic-lockdown.rules"),
+            include_str!("../../fixtures/synthetic-lockdown.expected.txt"),
+        ),
+        (
+            "panic",
+            include_str!("../../fixtures/synthetic-panic.rules"),
+            include_str!("../../fixtures/synthetic-panic.expected.txt"),
+        ),
+        (
+            "precedence",
+            include_str!("../../fixtures/synthetic-precedence.rules"),
+            include_str!("../../fixtures/synthetic-precedence.expected.txt"),
+        ),
+    ];
 
     #[test]
     fn committed_fixture_matches_generator() {
@@ -71,9 +113,12 @@ mod tests {
     }
 
     #[test]
-    fn replay_matches_expected() {
+    fn replay_matches_expected_for_every_rule_case() {
         let capture = pcap::read(PCAP).unwrap();
-        let got = report(&capture, Arc::new(DomainBlocklist::new(["tracker.test"])));
-        assert_eq!(got, EXPECTED);
+        for (name, rules, expected) in CASES {
+            let config = flynn_rules::text::parse(rules).unwrap();
+            let policy = Arc::new(RulesPolicy::from_config(&config).unwrap());
+            assert_eq!(report(&capture, policy), *expected, "case {name}");
+        }
     }
 }

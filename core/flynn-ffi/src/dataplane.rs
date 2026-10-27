@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use flynn_dataplane::spool::SpoolSink;
 use flynn_dataplane::{
-    self as dp, DomainBlocklist, ForwarderConfig, ForwarderHandle, StatsSnapshot, Transport,
+    self as dp, ForwarderConfig, ForwarderHandle, Policy, RulesPolicy, StatsSnapshot, Transport,
 };
-use flynn_rules::Mode;
+use flynn_rules::RuleSet;
 use flynn_types::{AppId, Capabilities};
 
-use crate::FlynnError;
+use crate::{FlynnError, RulesInfo, rules::info_of};
 
 /// A flow's five-tuple, passed to hosts as strings so neither Swift nor
 /// Kotlin needs a socket-address type.
@@ -41,9 +41,6 @@ impl From<&dp::FlowKey> for FlowKey {
 /// How the forwarder runs. Start from [`default_forwarder_settings`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ForwarderSettings {
-    pub mode: Mode,
-    /// Domains (and their subdomains) to block whatever the mode.
-    pub blocked_domains: Vec<String>,
     pub mtu: u32,
     pub tcp_recv_buffer_kib: u32,
     pub tcp_send_buffer_kib: u32,
@@ -65,8 +62,6 @@ pub struct DnsRedirect {
 #[uniffi::export]
 pub fn default_forwarder_settings() -> ForwarderSettings {
     ForwarderSettings {
-        mode: Mode::AllowAll,
-        blocked_domains: Vec::new(),
         mtu: 1500,
         tcp_recv_buffer_kib: 16,
         tcp_send_buffer_kib: 32,
@@ -77,10 +72,8 @@ pub fn default_forwarder_settings() -> ForwarderSettings {
 }
 
 impl ForwarderSettings {
-    fn to_config(&self) -> Result<ForwarderConfig, FlynnError> {
+    fn to_config(&self, policy: Arc<dyn Policy>) -> Result<ForwarderConfig, FlynnError> {
         let invalid = |message: String| FlynnError::InvalidSettings { message };
-        let policy =
-            Arc::new(DomainBlocklist::new(self.blocked_domains.clone()).with_mode(self.mode));
         let mut config = ForwarderConfig::new(policy);
         if !(576..=65535).contains(&self.mtu) {
             return Err(invalid(format!("mtu {} out of range", self.mtu)));
@@ -138,6 +131,18 @@ pub trait HostNotifier: Send + Sync {
 struct Running {
     handle: ForwarderHandle,
     sink: Arc<SpoolSink>,
+    policy: Arc<RulesPolicy>,
+}
+
+/// What starting the forwarder found.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct StartReport {
+    /// The rules the forwarder starts with.
+    pub rules: RulesInfo,
+    /// Set when the rules file exists but could not be used (damaged, or a
+    /// version this build does not read). The forwarder then runs
+    /// allow-all, and the host should tell the user.
+    pub rules_error: Option<String>,
 }
 
 /// The data plane, as seen by a capture extension.
@@ -182,18 +187,66 @@ impl FlynnDataPlane {
         self.lock().set_capabilities(capabilities);
     }
 
-    /// Starts the forwarder thread, writing events to the spool.
-    pub fn start(&self, settings: ForwarderSettings) -> Result<(), FlynnError> {
+    /// Starts the forwarder thread, writing events to the spool, with the
+    /// rules in the snapshot file (allow-all if there is none).
+    pub fn start(&self, settings: ForwarderSettings) -> Result<StartReport, FlynnError> {
         let mut running = self.running.write().unwrap_or_else(|e| e.into_inner());
         if running.is_some() {
             return Err(FlynnError::AlreadyRunning);
         }
-        let config = settings.to_config()?;
         let plane = self.lock();
+        let (initial, rules_error) = match dp::load_rules(&plane.host().paths.rule_snapshot()) {
+            Ok(Some(rules)) => (rules, None),
+            Ok(None) => (RuleSet::allow_all(), None),
+            Err(e) => (RuleSet::allow_all(), Some(e.to_string())),
+        };
+        let report = StartReport {
+            rules: info_of(&initial),
+            rules_error,
+        };
+        let policy = Arc::new(RulesPolicy::new(initial));
+        let config = settings.to_config(policy.clone())?;
         let sink = Arc::new(SpoolSink::open(&plane.host().paths.spool_dir())?);
         let handle = plane.start(config, sink.clone())?;
-        *running = Some(Running { handle, sink });
-        Ok(())
+        *running = Some(Running {
+            handle,
+            sink,
+            policy,
+        });
+        Ok(report)
+    }
+
+    /// Reads the snapshot file again and swaps its rules in without
+    /// restarting anything. Flows already open are checked against them at
+    /// once: a flow the new rules block is reset. A missing file means
+    /// allow-all; a damaged one is an error and the current rules stay.
+    pub fn reload_rules(&self) -> Result<RulesInfo, FlynnError> {
+        let running = self.running.read().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = running.as_ref() else {
+            return Err(FlynnError::Io {
+                message: "the data plane is not running".into(),
+            });
+        };
+        let path = self.lock().host().paths.rule_snapshot();
+        let rules = match dp::load_rules(&path) {
+            Ok(Some(rules)) => rules,
+            Ok(None) => RuleSet::allow_all(),
+            Err(e) => {
+                return Err(FlynnError::InvalidRules {
+                    message: e.to_string(),
+                });
+            }
+        };
+        let info = info_of(&rules);
+        r.policy.replace(rules);
+        r.handle.wake();
+        Ok(info)
+    }
+
+    /// The rules in force, or `None` while not running.
+    pub fn rules_info(&self) -> Option<RulesInfo> {
+        let running = self.running.read().ok()?;
+        Some(info_of(&running.as_ref()?.policy.rules()))
     }
 
     /// Hands packets read from the tunnel to the forwarder. Dropped when
@@ -402,8 +455,101 @@ mod tests {
             upstream: "1.1.1.1:53".into(),
         });
         assert!(matches!(
-            s.to_config(),
+            s.to_config(Arc::new(RulesPolicy::allow_all())),
             Err(FlynnError::InvalidSettings { .. })
         ));
+    }
+
+    fn lockdown_snapshot(dir: &std::path::Path, generation: u64) {
+        let config = crate::parse_rules_text("mode lockdown\n".into()).unwrap();
+        crate::write_rule_snapshot(
+            dir.join("rules.snapshot").to_string_lossy().into_owned(),
+            config,
+            generation,
+        )
+        .unwrap();
+    }
+
+    fn udp_to(port: u16) -> Vec<u8> {
+        flynn_proto::build::udp_packet(
+            "10.0.0.2:5000".parse().unwrap(),
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            b"x",
+        )
+    }
+
+    #[test]
+    fn start_loads_the_rules_file_and_reload_swaps_it_live() {
+        let dir = std::env::temp_dir().join(format!("flynn-ffi-rules-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = plane(&dir);
+        assert_eq!(p.rules_info(), None, "not running yet");
+
+        // No file: allow-all, and no complaint.
+        let report = p.start(default_forwarder_settings()).unwrap();
+        assert_eq!(report.rules.mode, flynn_rules::Mode::AllowAll);
+        assert_eq!(report.rules_error, None);
+        p.push_packets(vec![udp_to(9)]);
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Lockdown written and reloaded: new flows are blocked at once.
+        lockdown_snapshot(&dir, 11);
+        let info = p.reload_rules().unwrap();
+        assert_eq!(
+            (info.mode, info.generation),
+            (flynn_rules::Mode::Lockdown, 11)
+        );
+        assert_eq!(p.rules_info(), Some(info));
+        p.push_packets(vec![udp_to(10)]);
+        std::thread::sleep(Duration::from_millis(100));
+
+        // A damaged file is refused and the current rules stay.
+        let path = dir.join("rules.snapshot");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            p.reload_rules(),
+            Err(FlynnError::InvalidRules { .. })
+        ));
+        assert_eq!(p.rules_info().unwrap().mode, flynn_rules::Mode::Lockdown);
+
+        p.stop();
+        let events = spool_tail(dir.to_string_lossy().into_owned(), 200).unwrap();
+        let opened = |port: &str, verdict: flynn_rules::Verdict| {
+            events.iter().any(|e| {
+                matches!(e, SpoolEvent::FlowOpened { dst, verdict: v, .. }
+                    if dst.ends_with(port) && *v == verdict)
+            })
+        };
+        assert!(opened(":9", flynn_rules::Verdict::Allow));
+        assert!(opened(":10", flynn_rules::Verdict::Block));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_rules_file_at_start_runs_allow_all_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("flynn-ffi-rules-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("rules.snapshot"),
+            b"definitely not a snapshot, but long enough",
+        )
+        .unwrap();
+        let p = plane(&dir);
+        let report = p.start(default_forwarder_settings()).unwrap();
+        assert_eq!(report.rules.mode, flynn_rules::Mode::AllowAll);
+        assert!(report.rules_error.is_some());
+        p.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_needs_a_running_data_plane() {
+        let p = plane(&std::env::temp_dir());
+        assert!(p.reload_rules().is_err());
     }
 }

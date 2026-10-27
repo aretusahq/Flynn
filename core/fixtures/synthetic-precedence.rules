@@ -1,0 +1,8 @@
+# Specific beats general. Block beats allow only when the two are equally specific.
+block subdomains example.com            # 1  a wildcard
+allow domain www.example.com            # 2  an exact name beats the wildcard
+block address 203.0.113.7 tcp port 443  # 3  one address, narrowed by transport and port
+allow domain ads.tracker.test           # 4  an exact name too, but rule 3 also names a port and
+                                        #    a transport, so it is more specific for these flows
+block cidr 198.51.100.0/24              # 5  a range
+allow address 198.51.100.20 tcp         # 6  one address beats the range around it

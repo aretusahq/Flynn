@@ -7,12 +7,16 @@
 
 mod dataplane;
 mod library;
+mod rules;
+mod selftest;
 
 pub use dataplane::*;
 pub use library::*;
+pub use rules::*;
+pub use selftest::*;
 
 use flynn_dataplane::{CloseReason, MemSample, NameSource, StatsSnapshot, Transport};
-use flynn_rules::{Mode, Verdict};
+use flynn_rules::{Action, Mode, Reason, Verdict};
 use flynn_types::{AppId, Capabilities, LeakScope, Platform};
 
 uniffi::setup_scaffolding!();
@@ -31,6 +35,8 @@ pub enum FlynnError {
     InvalidSettings { message: String },
     #[error("the data plane is already running")]
     AlreadyRunning,
+    #[error("invalid rules: {message}")]
+    InvalidRules { message: String },
 }
 
 impl From<std::io::Error> for FlynnError {
@@ -90,6 +96,23 @@ pub enum Mode {
 pub enum Verdict {
     Allow,
     Block,
+}
+
+#[uniffi::remote(Enum)]
+pub enum Action {
+    Allow,
+    Block,
+}
+
+/// Why a connection got its verdict.
+#[uniffi::remote(Enum)]
+pub enum Reason {
+    Panic,
+    Lockdown,
+    Rule { id: u32 },
+    Essential,
+    ModeDefault,
+    AwaitingName,
 }
 
 #[uniffi::remote(Enum)]

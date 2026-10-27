@@ -5,7 +5,7 @@ use std::path::Path;
 
 use flynn_dataplane::spool;
 use flynn_dataplane::{CloseReason, Event, MemSample, NameSource, StatsSnapshot, Transport};
-use flynn_rules::Verdict;
+use flynn_rules::{Reason, Verdict};
 use flynn_types::AppId;
 
 use crate::FlynnError;
@@ -23,6 +23,15 @@ pub enum SpoolEvent {
         source: NameSource,
         app: Option<AppId>,
         verdict: Verdict,
+        reason: Reason,
+    },
+    /// The verdict changed after the flow opened: its server name arrived,
+    /// or the rules were replaced.
+    FlowDecided {
+        id: u64,
+        at_ms: i64,
+        verdict: Verdict,
+        reason: Reason,
     },
     FlowNamed {
         id: u64,
@@ -59,6 +68,7 @@ impl From<Event> for SpoolEvent {
                 source,
                 app,
                 verdict,
+                reason,
             } => SpoolEvent::FlowOpened {
                 id,
                 at_ms,
@@ -69,6 +79,18 @@ impl From<Event> for SpoolEvent {
                 source,
                 app,
                 verdict,
+                reason,
+            },
+            Event::FlowDecided {
+                id,
+                at_ms,
+                verdict,
+                reason,
+            } => SpoolEvent::FlowDecided {
+                id,
+                at_ms,
+                verdict,
+                reason,
             },
             Event::FlowNamed { id, name, source } => SpoolEvent::FlowNamed { id, name, source },
             Event::FlowClosed {

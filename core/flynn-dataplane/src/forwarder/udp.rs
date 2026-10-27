@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 
 use flynn_proto::quic::{InitialSniffer, QuicSni};
 use flynn_proto::{build, dns};
-use flynn_rules::Verdict;
+use flynn_rules::{Decision, NameState};
 use flynn_types::AppId;
 
 use crate::FlowKey;
 use crate::events::{CloseReason, Event, EventSink, FlowId};
 use crate::names::{DnsCache, NameSource};
-use crate::policy::{FlowMeta, Policy};
+use crate::policy::{FlowMeta, Policy, Standing};
 
 /// Datagrams held per QUIC flow while reading its name.
 const MAX_HELD: usize = 6;
@@ -29,8 +29,12 @@ pub(crate) struct UdpFlow {
     pub last_active: Instant,
     pub is_dns: bool,
     pub answered: bool,
-    /// The flow has a name, from DNS at open or from its Initial packets.
-    pub named: bool,
+    /// The best name known: from DNS at open, replaced by the name read from
+    /// the QUIC Initial packets.
+    pub name: Option<String>,
+    /// What the log last said about this flow, and whether a decision still
+    /// waits on the server name.
+    pub standing: Standing,
     /// Present while the first QUIC datagrams are held for naming.
     pub quic: Option<QuicHold>,
     pub bytes_up: u64,
@@ -62,42 +66,75 @@ pub(crate) struct QuicCtx<'a> {
     /// TCP, where the TLS server name is visible.
     pub force_tcp_unnamed: bool,
     pub wait: Duration,
+    pub now_ms: i64,
 }
 
 impl UdpFlow {
+    /// Decides again with what is known about the name now, and tells the
+    /// log if the verdict or its reason changed. `Wait` changes nothing.
+    pub fn redecide(
+        &mut self,
+        name: NameState<'_>,
+        policy: &dyn Policy,
+        sink: &dyn EventSink,
+        now_ms: i64,
+    ) -> Decision {
+        let decision = policy.decide(&FlowMeta {
+            key: &self.key,
+            name,
+            app: self.app.as_ref(),
+        });
+        if let Some((verdict, reason)) = self.standing.update(decision) {
+            sink.emit(Event::FlowDecided {
+                id: self.id,
+                at_ms: now_ms,
+                verdict,
+                reason,
+            });
+        }
+        decision
+    }
+
+    /// Decides again from the name this flow already has, after the rules
+    /// changed. A flow still holding its first datagrams may yet be named.
+    pub fn recheck(&mut self, policy: &dyn Policy, sink: &dyn EventSink, now_ms: i64) -> Decision {
+        let name = self.name.clone();
+        let state = match &name {
+            Some(n) => NameState::Known(n),
+            None if self.quic.is_some() => NameState::Pending,
+            None => NameState::Unavailable,
+        };
+        self.redecide(state, policy, sink, now_ms)
+    }
+
     /// App to server. Held while a QUIC flow is being named; otherwise sent.
     pub fn handle_app_datagram(&mut self, payload: &[u8], ctx: &QuicCtx<'_>) {
         self.last_active = Instant::now();
-        if self.quic.is_none() {
-            self.send(payload);
-            return;
-        }
         let Some(hold) = self.quic.as_mut() else {
+            self.send(payload);
             return;
         };
         hold.held.push(payload.to_vec());
+        let held = hold.held.len();
         match hold.sniffer.feed(payload) {
             QuicSni::Found(name) => {
-                let verdict = ctx.policy.decide(&FlowMeta {
-                    key: &self.key,
-                    name: Some(&name),
-                    app: self.app.as_ref(),
-                });
                 ctx.sink.emit(Event::FlowNamed {
                     id: self.id,
-                    name,
+                    name: name.clone(),
                     source: NameSource::Sni,
                 });
-                self.named = true;
-                if verdict == Verdict::Block {
+                self.name = Some(name.clone());
+                let decision =
+                    self.redecide(NameState::Known(&name), ctx.policy, ctx.sink, ctx.now_ms);
+                if matches!(decision, Decision::Block(_)) {
                     self.quic = None;
                     self.finished = Some(CloseReason::Blocked);
                 } else {
                     self.release();
                 }
             }
-            QuicSni::Incomplete if hold.held.len() < MAX_HELD => {}
-            _ => self.resolve_unnamed(ctx),
+            QuicSni::Incomplete if held < MAX_HELD => {}
+            _ => self.settle_without_name(ctx),
         }
     }
 
@@ -108,13 +145,23 @@ impl UdpFlow {
             .as_ref()
             .is_some_and(|h| h.started.elapsed() >= ctx.wait)
         {
-            self.resolve_unnamed(ctx);
+            self.settle_without_name(ctx);
         }
     }
 
-    /// Naming failed or ran out of time.
-    fn resolve_unnamed(&mut self, ctx: &QuicCtx<'_>) {
-        if ctx.force_tcp_unnamed && !self.named {
+    /// Naming failed or ran out of time. Decide with what is known; a block
+    /// stands, and an unnamed flow may be dropped to push the app to TCP.
+    fn settle_without_name(&mut self, ctx: &QuicCtx<'_>) {
+        let name = self.name.clone();
+        let state = match &name {
+            Some(n) => NameState::Known(n),
+            None => NameState::Unavailable,
+        };
+        let decision = self.redecide(state, ctx.policy, ctx.sink, ctx.now_ms);
+        if matches!(decision, Decision::Block(_)) {
+            self.quic = None;
+            self.finished = Some(CloseReason::Blocked);
+        } else if ctx.force_tcp_unnamed && self.name.is_none() {
             self.quic = None;
             self.finished = Some(CloseReason::ForcedTcp);
         } else {

@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 
 use flynn_dataplane::forwarder::{self, ForwarderConfig, ForwarderHandle};
 use flynn_dataplane::{
-    AppResolver, Clock, CloseReason, DomainBlocklist, Event, EventSink, FlowKey, Host, HostError,
-    ModePolicy, NameSource, Notifier, PacketIo, Paths, Policy, SocketProtector,
+    AppResolver, Clock, CloseReason, Event, EventSink, FlowKey, Host, HostError, NameSource,
+    Notifier, PacketIo, Paths, Policy, RulesPolicy, SocketProtector,
 };
 use flynn_proto::{build, ip, transport};
-use flynn_rules::{Mode, Verdict};
+use flynn_rules::{Config as RulesConfig, Mode, Reason, RuleSet, Verdict};
 use flynn_types::AppId;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -30,6 +30,7 @@ const TLS: &str = "198.51.100.1:443";
 const DNS: &str = "198.51.100.53:53";
 const REFUSED: &str = "198.51.100.9:9";
 const QUIC: &str = "198.51.100.1:443";
+const SERVER_FIRST: &str = "198.51.100.3:80";
 
 // ----- Host stubs -----------------------------------------------------------
 
@@ -149,6 +150,20 @@ fn dns_server() -> SocketAddr {
     addr
 }
 
+/// Sends a greeting and closes first, like a server ending a keep-alive.
+fn server_first() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let _ = stream.write_all(b"hello");
+            // Dropped here: the server's FIN goes out first.
+        }
+    });
+    addr
+}
+
 /// Records every datagram it receives, in order.
 fn udp_recorder() -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -249,6 +264,7 @@ impl Rig {
             (TLS.parse().unwrap(), echo_server()),
             (DNS.parse().unwrap(), dns_server()),
             (REFUSED.parse().unwrap(), refused_port()),
+            (SERVER_FIRST.parse().unwrap(), server_first()),
         ]);
         tweak(&mut config);
         let fwd = forwarder::spawn(host, config, events.clone()).unwrap();
@@ -353,7 +369,7 @@ impl Rig {
 
 #[test]
 fn tcp_echo_round_trip_and_clean_close() {
-    let mut rig = Rig::new(Arc::new(ModePolicy(Mode::AllowAll)));
+    let mut rig = Rig::new(Arc::new(RulesPolicy::allow_all()));
     let h = rig.connect(ECHO);
     assert!(
         rig.until(Duration::from_secs(5), |r| r.socket(h).may_send()),
@@ -400,7 +416,7 @@ fn tcp_echo_round_trip_and_clean_close() {
 
 #[test]
 fn dns_answer_names_a_later_connection() {
-    let mut rig = Rig::new(Arc::new(ModePolicy(Mode::AllowAll)));
+    let mut rig = Rig::new(Arc::new(RulesPolicy::allow_all()));
     rig.send_udp(
         DNS,
         &build::dns_query(0x77, "echo.test", flynn_proto::dns::TYPE_A),
@@ -448,7 +464,7 @@ fn dns_answer_names_a_later_connection() {
 
 #[test]
 fn server_name_in_client_hello_can_block() {
-    let mut rig = Rig::new(Arc::new(DomainBlocklist::new(["blocked.test"])));
+    let mut rig = Rig::new(Arc::new(RulesPolicy::blocking_domains(["blocked.test"])));
     let h = rig.connect(TLS);
     assert!(
         rig.until(Duration::from_secs(5), |r| r.socket(h).may_send()),
@@ -479,7 +495,7 @@ fn server_name_in_client_hello_can_block() {
 
 #[test]
 fn refused_server_resets_the_app_without_a_handshake() {
-    let mut rig = Rig::new(Arc::new(ModePolicy(Mode::AllowAll)));
+    let mut rig = Rig::new(Arc::new(RulesPolicy::allow_all()));
     let h = rig.connect(REFUSED);
     let mut ever_established = false;
     let closed = rig.until(Duration::from_secs(5), |r| {
@@ -501,7 +517,7 @@ fn refused_server_resets_the_app_without_a_handshake() {
 
 #[test]
 fn lockdown_blocks_at_open() {
-    let mut rig = Rig::new(Arc::new(ModePolicy(Mode::Lockdown)));
+    let mut rig = Rig::new(Arc::new(RulesPolicy::mode(Mode::Lockdown)));
     let h = rig.connect(ECHO);
     assert!(rig.until(Duration::from_secs(5), |r| r.socket(h).state()
         == tcp::State::Closed));
@@ -541,7 +557,10 @@ fn closed_reasons(rig: &Rig) -> Vec<CloseReason> {
 
 #[test]
 fn quic_flow_blocked_by_name_before_any_datagram_leaves() {
-    let (mut rig, seen) = quic_rig(Arc::new(DomainBlocklist::new(["blocked.test"])), false);
+    let (mut rig, seen) = quic_rig(
+        Arc::new(RulesPolicy::blocking_domains(["blocked.test"])),
+        false,
+    );
     for d in initials("www.blocked.test") {
         rig.send_udp_from(60000, QUIC, &d);
     }
@@ -572,7 +591,10 @@ fn quic_flow_blocked_by_name_before_any_datagram_leaves() {
 
 #[test]
 fn allowed_quic_flow_releases_held_datagrams_in_order() {
-    let (mut rig, seen) = quic_rig(Arc::new(DomainBlocklist::new(["blocked.test"])), false);
+    let (mut rig, seen) = quic_rig(
+        Arc::new(RulesPolicy::blocking_domains(["blocked.test"])),
+        false,
+    );
     let sent = initials("api.example.org");
     for d in &sent {
         rig.send_udp_from(60001, QUIC, d);
@@ -594,7 +616,7 @@ fn unnamed_quic_is_dropped_only_when_forcing_tcp() {
     let mut fake = vec![0xc3, 0, 0, 0, 1, 8];
     fake.resize(1200, 0x5a);
 
-    let (mut rig, seen) = quic_rig(Arc::new(ModePolicy(Mode::AllowAll)), true);
+    let (mut rig, seen) = quic_rig(Arc::new(RulesPolicy::allow_all()), true);
     rig.send_udp_from(60002, QUIC, &fake);
     assert!(rig.until(Duration::from_secs(5), |r| {
         closed_reasons(r).contains(&CloseReason::ForcedTcp)
@@ -602,11 +624,368 @@ fn unnamed_quic_is_dropped_only_when_forcing_tcp() {
     assert!(seen.lock().unwrap().is_empty());
     rig.stop();
 
-    let (mut rig, seen) = quic_rig(Arc::new(ModePolicy(Mode::AllowAll)), false);
+    let (mut rig, seen) = quic_rig(Arc::new(RulesPolicy::allow_all()), false);
     rig.send_udp_from(60003, QUIC, &fake);
     assert!(
         rig.until(Duration::from_secs(5), |_| seen.lock().unwrap().len() == 1),
         "unnamed QUIC was not released"
+    );
+    rig.stop();
+}
+
+// ----- Dropped packets -------------------------------------------------------
+
+#[test]
+fn dropped_packets_are_counted_by_cause() {
+    let mut rig = Rig::new(Arc::new(RulesPolicy::allow_all()));
+    let src: SocketAddr = (std::net::Ipv4Addr::from(APP_IP), 5000).into();
+    let dst: SocketAddr = "198.51.100.1:7".parse().unwrap();
+    let with_protocol = |proto: u8| {
+        let mut p = build::udp_packet(src, dst, &[0; 8]);
+        p[9] = proto;
+        p
+    };
+    let mut fragment = build::udp_packet(src, dst, &[0; 8]);
+    fragment[6..8].copy_from_slice(&0x0010u16.to_be_bytes());
+    let mut short_udp = build::udp_packet(src, dst, &[]);
+    short_udp.truncate(24); // a UDP header cut short
+    short_udp[2..4].copy_from_slice(&24u16.to_be_bytes());
+
+    rig.fwd.as_ref().unwrap().push_packets([
+        with_protocol(1),
+        with_protocol(1),
+        with_protocol(2),
+        fragment,
+        vec![0x45, 0, 0], // not even a full IP header
+        short_udp,
+    ]);
+    assert!(rig.until(
+        Duration::from_secs(5),
+        |r| r.fwd.as_ref().unwrap().stats().dropped == 6
+    ));
+    let d = rig.fwd.as_ref().unwrap().drop_breakdown();
+    assert_eq!(d.protocols, vec![(1, 2), (2, 1)]);
+    assert_eq!(d.fragments, 1);
+    assert_eq!(d.malformed, 2);
+    rig.stop();
+}
+
+// ----- How flows end ----------------------------------------------------------
+
+/// The server closes first and the app closes after: a complete four-way
+/// close. It reaches the forwarder's socket as FinWait2 straight to
+/// TimeWait, and must not be reported as a reset.
+#[test]
+fn a_clean_close_started_by_the_server_is_not_a_reset() {
+    let mut rig = Rig::new(Arc::new(RulesPolicy::allow_all()));
+    let h = rig.connect(SERVER_FIRST);
+    let mut got = Vec::new();
+    assert!(
+        rig.until(Duration::from_secs(5), |r| {
+            let s = r.socket(h);
+            while s.can_recv() {
+                s.recv(|b| {
+                    got.extend_from_slice(b);
+                    (b.len(), ())
+                })
+                .unwrap();
+            }
+            s.state() == tcp::State::CloseWait // the server's FIN has arrived
+        }),
+        "the server's FIN never reached the app"
+    );
+    assert_eq!(got, b"hello");
+    rig.socket(h).close();
+    assert!(
+        rig.until(Duration::from_secs(5), |r| !r.events.closed().is_empty()),
+        "flow never closed"
+    );
+    assert_eq!(closed_reasons(&rig), vec![CloseReason::Normal]);
+    assert!(rig.fwd.as_ref().unwrap().abort_causes().is_empty());
+    rig.stop();
+}
+
+/// An app that resets an established connection is a reset, and the cause
+/// says who did it.
+#[test]
+fn an_app_reset_is_counted_with_its_cause() {
+    let mut rig = Rig::new(Arc::new(RulesPolicy::allow_all()));
+    let h = rig.connect(ECHO);
+    assert!(
+        rig.until(Duration::from_secs(5), |r| r.socket(h).may_send()),
+        "handshake"
+    );
+    // Round-trip some data so the forwarder has certainly seen the
+    // connection established before it is reset.
+    rig.socket(h).send_slice(&[7; 100]).unwrap();
+    let mut echoed = 0;
+    assert!(rig.until(Duration::from_secs(5), |r| {
+        let s = r.socket(h);
+        while s.can_recv() {
+            echoed += s.recv(|b| (b.len(), b.len())).unwrap();
+        }
+        echoed == 100
+    }));
+    rig.socket(h).abort();
+    assert!(
+        rig.until(Duration::from_secs(5), |r| !r.events.closed().is_empty()),
+        "flow never closed"
+    );
+    assert_eq!(closed_reasons(&rig), vec![CloseReason::Reset]);
+    assert_eq!(
+        rig.fwd.as_ref().unwrap().abort_causes(),
+        vec![("app reset an open connection".to_string(), 1)]
+    );
+    rig.stop();
+}
+
+/// After `stop()` returns, every flow still open has been closed and
+/// reported, so the spool ends complete.
+#[test]
+fn stopping_reports_every_open_flow() {
+    let mut rig = Rig::new(Arc::new(RulesPolicy::allow_all()));
+    let a = rig.connect(ECHO);
+    let b = rig.connect(ECHO);
+    assert!(rig.until(Duration::from_secs(5), |r| r.socket(a).may_send()
+        && r.socket(b).may_send()));
+    rig.stop();
+    let opened = rig
+        .events
+        .events()
+        .iter()
+        .filter(|e| matches!(e, Event::FlowOpened { .. }))
+        .count();
+    assert_eq!(opened, 2);
+    assert_eq!(closed_reasons(&rig), vec![CloseReason::Shutdown; 2]);
+}
+
+/// An app that has already given up on a connection answers our SYN-ACK
+/// with a reset. The flow must end at once, not after the connect timeout.
+#[test]
+fn an_app_that_abandoned_its_syn_ends_the_flow_promptly() {
+    let mut rig = Rig::new(Arc::new(RulesPolicy::allow_all()));
+    // A SYN from a port the app side has no socket for: the app's stack
+    // answers the SYN-ACK with a reset, as a closed socket does.
+    let src: SocketAddr = (std::net::Ipv4Addr::from(APP_IP), 41000).into();
+    let syn = build::tcp_packet(
+        src,
+        ECHO.parse().unwrap(),
+        1000,
+        0,
+        flynn_proto::transport::TcpFlags::SYN,
+        &[],
+    );
+    rig.fwd.as_ref().unwrap().push_packets([syn]);
+    assert!(
+        rig.until(Duration::from_secs(3), |r| !r.events.closed().is_empty()),
+        "the flow lingered instead of ending: {:?}",
+        rig.events.events()
+    );
+    assert_eq!(closed_reasons(&rig), vec![CloseReason::Reset]);
+    assert_eq!(
+        rig.fwd.as_ref().unwrap().abort_causes(),
+        vec![(
+            "app abandoned the connection before its handshake finished".to_string(),
+            1
+        )]
+    );
+    rig.stop();
+}
+
+// ----- Rules ------------------------------------------------------------------
+
+fn policy_from(text: &str) -> Arc<RulesPolicy> {
+    let config = flynn_rules::text::parse(text).unwrap();
+    Arc::new(RulesPolicy::from_config(&config).unwrap())
+}
+
+fn decisions(rig: &Rig) -> Vec<(Verdict, Reason)> {
+    rig.events
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::FlowDecided {
+                verdict, reason, ..
+            } => Some((verdict, reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn echo_roundtrip(rig: &mut Rig, h: SocketHandle, payload: &[u8]) -> bool {
+    rig.socket(h).send_slice(payload).unwrap();
+    let mut echoed = 0;
+    rig.until(Duration::from_secs(5), |r| {
+        let s = r.socket(h);
+        while s.can_recv() {
+            echoed += s.recv(|b| (b.len(), b.len())).unwrap();
+        }
+        echoed == payload.len()
+    })
+}
+
+/// Block-all with one allow rule: a connection's name decides it, so the
+/// flow opens awaiting its name, the allowed site goes through and anything
+/// else is reset once its ClientHello names it.
+#[test]
+fn block_all_lets_only_the_allowed_name_through() {
+    let mut rig = Rig::new(policy_from("mode block-all\nallow domain ok.test\n"));
+
+    let good = rig.connect(TLS);
+    assert!(rig.until(Duration::from_secs(5), |r| r.socket(good).may_send()));
+    let hello = build::client_hello(Some("ok.test"), 100);
+    assert!(
+        echo_roundtrip(&mut rig, good, &hello),
+        "the allowed name did not get through"
+    );
+
+    let bad = rig.connect(TLS);
+    assert!(rig.until(Duration::from_secs(5), |r| r.socket(bad).may_send()));
+    rig.socket(bad)
+        .send_slice(&build::client_hello(Some("other.test"), 100))
+        .unwrap();
+    assert!(
+        rig.until(Duration::from_secs(5), |r| r.socket(bad).state()
+            == tcp::State::Closed),
+        "the other name was not reset"
+    );
+
+    let opened_waiting = rig
+        .events
+        .events()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::FlowOpened {
+                    reason: Reason::AwaitingName,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        opened_waiting, 2,
+        "both flows should open awaiting their name"
+    );
+    let d = decisions(&rig);
+    assert!(
+        d.contains(&(Verdict::Allow, Reason::Rule { id: 1 })),
+        "{d:?}"
+    );
+    assert!(d.contains(&(Verdict::Block, Reason::ModeDefault)), "{d:?}");
+    rig.stop();
+}
+
+/// Lockdown has to cut connections that are already up, not only new ones.
+#[test]
+fn replacing_the_rules_with_lockdown_resets_flows_that_are_already_open() {
+    let policy = Arc::new(RulesPolicy::allow_all());
+    let mut rig = Rig::new(policy.clone());
+    let h = rig.connect(ECHO);
+    assert!(rig.until(Duration::from_secs(5), |r| r.socket(h).may_send()));
+    assert!(echo_roundtrip(&mut rig, h, &[9; 64]));
+
+    let lockdown = RulesConfig {
+        mode: Mode::Lockdown,
+        ..RulesConfig::default()
+    };
+    policy.replace(RuleSet::compile(&lockdown, 2).unwrap());
+    rig.fwd.as_ref().unwrap().wake();
+
+    // Well inside the forwarder's one-second poll timeout, so this passes
+    // only if the wake after `replace` really reaches it.
+    assert!(
+        rig.until(Duration::from_millis(600), |r| r.socket(h).state()
+            == tcp::State::Closed),
+        "the open flow survived lockdown"
+    );
+    assert!(rig.until(Duration::from_secs(2), |r| {
+        closed_reasons(r).contains(&CloseReason::Blocked)
+    }));
+    assert!(decisions(&rig).contains(&(Verdict::Block, Reason::Lockdown)));
+    rig.stop();
+}
+
+/// Panic overrides lockdown, for connections opened afterwards too.
+#[test]
+fn panic_overrides_lockdown_and_traffic_flows_again() {
+    let policy = Arc::new(RulesPolicy::mode(Mode::Lockdown));
+    let mut rig = Rig::new(policy.clone());
+    let sealed = rig.connect(ECHO);
+    assert!(
+        rig.until(Duration::from_secs(5), |r| r.socket(sealed).state()
+            == tcp::State::Closed)
+    );
+
+    let panic = RulesConfig {
+        mode: Mode::Lockdown,
+        panic: true,
+        ..RulesConfig::default()
+    };
+    policy.replace(RuleSet::compile(&panic, 3).unwrap());
+    rig.fwd.as_ref().unwrap().wake();
+
+    let h = rig.connect(ECHO);
+    assert!(
+        rig.until(Duration::from_secs(5), |r| r.socket(h).may_send()),
+        "no handshake after panic"
+    );
+    assert!(echo_roundtrip(&mut rig, h, &[1; 32]));
+    rig.stop();
+}
+
+/// A decision that waits on a name must not wait for ever: a server that
+/// speaks first never sends a ClientHello, and until the decision settles
+/// nothing moves either way, so its greeting is never delivered if the
+/// flow turns out to be blocked.
+#[test]
+fn a_flow_awaiting_a_name_that_never_comes_settles_after_the_quiet_period() {
+    let mut rig = Rig::new(policy_from("mode block-all\n"));
+    let h = rig.connect(SERVER_FIRST);
+    let mut received = 0;
+    assert!(
+        rig.until(Duration::from_secs(4), |r| {
+            let s = r.socket(h);
+            while s.can_recv() {
+                received += s.recv(|b| (b.len(), b.len())).unwrap();
+            }
+            s.state() == tcp::State::Closed
+        }),
+        "the flow was never settled"
+    );
+    assert_eq!(
+        received, 0,
+        "the server's greeting leaked before the decision"
+    );
+    assert!(decisions(&rig).contains(&(Verdict::Block, Reason::ModeDefault)));
+    rig.stop();
+}
+
+/// An allow rule for a name also holds for QUIC: the Initial names the flow
+/// and releases the held datagrams.
+#[test]
+fn block_all_releases_quic_to_an_allowed_name_only() {
+    let (mut rig, seen) = quic_rig(policy_from("mode block-all\nallow domain ok.test\n"), false);
+    let allowed = initials("ok.test");
+    for d in &allowed {
+        rig.send_udp_from(60010, QUIC, d);
+    }
+    assert!(
+        rig.until(Duration::from_secs(5), |_| seen.lock().unwrap().len()
+            == allowed.len())
+    );
+
+    for d in initials("other.test") {
+        rig.send_udp_from(60011, QUIC, &d);
+    }
+    assert!(rig.until(Duration::from_secs(5), |r| {
+        closed_reasons(r).contains(&CloseReason::Blocked)
+    }));
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        allowed.len(),
+        "a blocked QUIC flow reached the server"
     );
     rig.stop();
 }
